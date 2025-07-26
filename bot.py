@@ -1,69 +1,37 @@
 from flask import Flask, request, jsonify
 import os
 import csv
-from datetime import datetime
 
 app = Flask(__name__)
-
-LOGS_DIR = "logs"
-os.makedirs(LOGS_DIR, exist_ok=True)
-
-REQUIRED_FIELDS = {"signal", "symbol", "time", "side", "pattern", "entry", "tp", "sl", "p", "leverage"}
-ALLOWED_PATTERNS = {"engulfing", "wick", "insidebar", "threebar"}
-
-def is_duplicate(filename, time_str, symbol, side):
-    if not os.path.exists(filename):
-        return False
-    with open(filename, newline="") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            if row["time"] == time_str and row["symbol"] == symbol and row["side"] == side:
-                return True
-    return False
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
 
-    if not data or not REQUIRED_FIELDS.issubset(data.keys()):
+    required_fields = ["signal", "pattern", "side", "entry"]
+    if not all(field in data for field in required_fields):
         return jsonify({"status": "error", "message": "Missing required fields"}), 400
 
-    try:
-        signal     = data["signal"]
-        symbol     = data["symbol"]
-        time_str   = data["time"]
-        side       = data["side"]
-        pattern    = data["pattern"].lower()
-        if pattern not in ALLOWED_PATTERNS:
-            return jsonify({"status": "error", "message": "Invalid pattern"}), 400
+    if data["signal"] != "entry":
+        return jsonify({"status": "ignored", "message": "Not an entry signal"}), 200
 
-        entry      = float(data["entry"])
-        tp         = float(data["tp"])
-        sl         = float(data["sl"])
-        p          = float(data["p"])
-        leverage   = int(data["leverage"])
+    pattern = data["pattern"].lower()
+    side = data["side"].lower()
+    entry = data["entry"]
 
-        filename = os.path.join(LOGS_DIR, f"{pattern}.csv")
-        timestamp = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-        iso_time = timestamp.isoformat()
+    filename = f"{pattern}_{side}.csv"
+    filepath = os.path.join(LOG_DIR, filename)
+    is_new_file = not os.path.exists(filepath)
 
-        if is_duplicate(filename, iso_time, symbol, side):
-            print(f"[DUPLICATE] {symbol} {side} at {iso_time}")
-            return jsonify({"status": "duplicate"}), 200
+    with open(filepath, mode="a", newline="") as file:
+        writer = csv.writer(file)
+        if is_new_file:
+            writer.writerow(["entry"])
+        writer.writerow([entry])
 
-        file_exists = os.path.isfile(filename)
-        with open(filename, "a", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            if not file_exists:
-                writer.writerow(["time", "symbol", "side", "entry", "tp", "sl", "p", "leverage"])
-            writer.writerow([iso_time, symbol, side, entry, tp, sl, p, leverage])
-
-        print(f"[RECEIVED] {pattern.upper()} {side} on {symbol} at {iso_time}")
-        return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        print(f"[ERROR] {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+    return jsonify({"status": "success", "message": "Signal saved"}), 200
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    app.run(host="0.0.0.0", port=5000)
