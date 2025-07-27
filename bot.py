@@ -10,7 +10,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 def webhook():
     data = request.get_json()
 
-    required_fields = ["signal", "pattern", "side", "entry"]
+    required_fields = ["signal", "pattern", "side", "entry", "tp"]
     if not all(field in data for field in required_fields):
         return jsonify({"status": "error", "message": "Missing required fields"}), 400
 
@@ -20,6 +20,7 @@ def webhook():
     pattern = data["pattern"].lower()
     side = data["side"].lower()
     entry = data["entry"]
+    tp = data["tp"]
 
     filename = f"{pattern}_{side}.csv"
     filepath = os.path.join(LOG_DIR, filename)
@@ -28,10 +29,11 @@ def webhook():
     with open(filepath, mode="a", newline="") as file:
         writer = csv.writer(file)
         if is_new_file:
-            writer.writerow(["entry"])
-        writer.writerow([entry])
+            writer.writerow(["entry", "tp"])
+        writer.writerow([entry, tp])
 
     return jsonify({"status": "success", "message": "Signal saved"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
