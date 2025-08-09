@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
-import os
-import csv
+import os, csv
 
 app = Flask(__name__)
 LOG_DIR = "logs"
@@ -8,32 +7,47 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
 
-    # Тепер потрібні SL замість TP
-    required_fields = ["signal", "pattern", "side", "entry", "sl"]
-    if not all(field in data for field in required_fields):
-        return jsonify({"status": "error", "message": "Missing required fields"}), 400
+    # Обов'язкові для всіх етапів
+    for k in ["signal", "pattern", "side", "entry"]:
+        if k not in data:
+            return jsonify({"status": "error", "message": f"Missing required field: {k}"}), 400
 
-    if data["signal"] != "entry":
+    if str(data["signal"]).lower() != "entry":
         return jsonify({"status": "ignored", "message": "Not an entry signal"}), 200
 
-    pattern = data["pattern"].lower()
-    side = data["side"].lower()
-    entry = data["entry"]
-    sl = data["sl"]
+    # Нормалізація
+    symbol  = str(data.get("symbol", ""))
+    time_   = str(data.get("time", ""))
+    pattern = str(data["pattern"]).lower()
+    side    = str(data["side"]).lower()
+    entry   = str(data["entry"])
+    sl      = str(data.get("sl", ""))          # може бути відсутнім на Stage 1
+    tp      = str(data.get("tp", ""))          # опційний на Stage 3
 
+    # Визначимо stage для логів
+    stage = "1"
+    if sl and not tp:
+        stage = "2"
+    if sl and tp:
+        stage = "3"
+
+    # Пишемо окремий CSV по кожній комбінації pattern+side
     filename = f"{pattern}_{side}.csv"
     filepath = os.path.join(LOG_DIR, filename)
-    is_new_file = not os.path.exists(filepath)
+    new_file = not os.path.exists(filepath)
 
-    with open(filepath, mode="a", newline="") as file:
-        writer = csv.writer(file)
-        if is_new_file:
-            writer.writerow(["entry", "sl"])
-        writer.writerow([entry, sl])
+    with open(filepath, "a", newline="") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(["time","symbol","pattern","side","stage","entry","sl","tp"])
+        w.writerow([time_, symbol, pattern, side, stage, entry, sl, tp])
 
-    return jsonify({"status": "success", "message": "Signal saved"}), 200
+    return jsonify({"status": "success", "stage": stage, "saved": {"pattern": pattern, "side": side}}), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # Render/локально
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
