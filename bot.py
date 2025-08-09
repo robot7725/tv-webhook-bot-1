@@ -1,76 +1,91 @@
+# bot.py
+import os, csv, threading
 from flask import Flask, request, jsonify
-import os, csv, time
+from collections import OrderedDict
 
 app = Flask(__name__)
-LOG_DIR = "logs"
+LOCK = threading.Lock()
+
+# === ENV ===
+LOG_DIR = os.environ.get("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, os.environ.get("LOG_FILE", "engulfing.csv"))
+ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
 
-# Примітивна дедуплікація у пам'яті (ключ на 30с)
-SEEN = {}  # key -> timestamp
-DEDUP_TTL = 30
+# === Простий LRU-дедуп по ключу symbol|time|side|pattern ===
+MAX_KEYS = 1000
+DEDUP = OrderedDict()
 
-def dedup_key(d):
-    # якщо є унікальний id — краще ним
-    if "id" in d:
-        return f"id:{d.get('id')}"
-    # запасний ключ
-    return f"{d.get('pattern','')}|{d.get('side','')}|{d.get('time','')}"
+def _key(symbol, time_s, side, pattern):
+    return f"{symbol}|{time_s}|{side}|{pattern}".lower()
 
-def purge_seen():
-    now = time.time()
-    for k, t in list(SEEN.items()):
-        if now - t > DEDUP_TTL:
-            del SEEN[k]
+def _seen(key):
+    with LOCK:
+        if key in DEDUP:
+            DEDUP.move_to_end(key)
+            return True
+        DEDUP[key] = True
+        if len(DEDUP) > MAX_KEYS:
+            DEDUP.popitem(last=False)
+        return False
 
-@app.route("/healthz", methods=["GET"])
-def health():
-    return jsonify({"status":"ok","service":"tv-webhook-bot","time":time.time()}), 200
+def _to_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def _validate(d):
+    req = ["signal","symbol","time","side","pattern","entry","tp","sl"]
+    miss = [k for k in req if k not in d]
+    if miss:
+        return False, f"Missing fields: {','.join(miss)}"
+    if str(d["signal"]).lower() != "entry":
+        return False, "signal must be 'entry'"
+    if str(d["pattern"]).lower() != ALLOW_PATTERN:
+        return False, f"pattern must be '{ALLOW_PATTERN}' for this bot"
+    if str(d["side"]).lower() not in ("long","short"):
+        return False, "side must be long/short"
+
+    entry = _to_float(d["entry"]); tp = _to_float(d["tp"]); sl = _to_float(d["sl"])
+    if entry is None or tp is None or sl is None:
+        return False, "entry/tp/sl must be numeric"
+    return True, {"entry": entry, "tp": tp, "sl": sl}
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception as e:
+        return jsonify({"status":"error","msg":f"bad json: {e}"}), 400
 
-    # Базові поля для всіх етапів
-    for k in ["signal", "pattern", "side", "entry"]:
-        if k not in data:
-            return jsonify({"status": "error", "message": f"Missing required field: {k}"}), 400
-    if str(data["signal"]).lower() != "entry":
-        return jsonify({"status": "ignored", "message": "Not an entry signal"}), 200
+    ok, info = _validate(data or {})
+    if not ok:
+        return jsonify({"status":"error","msg":info}), 400
 
-    # Антидубль
-    purge_seen()
-    key = dedup_key(data)
-    if key in SEEN:
-        return jsonify({"status":"ignored","reason":"duplicate","key":key}), 200
-    SEEN[key] = time.time()
-
-    # Нормалізація
-    symbol  = str(data.get("symbol",""))
-    time_   = str(data.get("time",""))
-    pattern = str(data["pattern"]).lower()
+    symbol  = str(data["symbol"])
+    time_s  = str(data["time"])      # беремо як є (ms або ISO — однаково)
     side    = str(data["side"]).lower()
-    entry   = str(data["entry"])
-    sl      = str(data.get("sl",""))
-    tp      = str(data.get("tp",""))
-    uid     = str(data.get("id",""))
+    pattern = str(data["pattern"]).lower()
+    key = _key(symbol, time_s, side, pattern)
 
-    # Визначаємо stage
-    stage = "1"
-    if sl and not tp: stage = "2"
-    if sl and tp:     stage = "3"
+    if _seen(key):
+        return jsonify({"status":"ok","msg":"duplicate ignored"}), 200
 
-    # Логи
-    fn = f"{pattern}_{side}.csv"
-    fp = os.path.join(LOG_DIR, fn)
-    newf = not os.path.exists(fp)
-    with open(fp, "a", newline="") as f:
-        w = csv.writer(f)
-        if newf: w.writerow(["time","symbol","pattern","side","stage","entry","sl","tp","id"])
-        w.writerow([time_, symbol, pattern, side, stage, entry, sl, tp, uid])
+    row = [time_s, symbol, pattern, side, info["entry"], info["tp"], info["sl"]]
 
-    return jsonify({"status": "success", "stage": stage}), 200
+    with LOCK:
+        newfile = not os.path.exists(LOG_FILE)
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if newfile:
+                w.writerow(["time","symbol","pattern","side","entry","tp","sl"])
+            w.writerow(row)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    return jsonify({"status":"ok","msg":"logged"}), 200
+
+@app.route("/", methods=["GET"])
+def root():
+    return "OK", 200
+
+# Render сам підставляє PORT і запускає через gunicorn (див. Procfile)
