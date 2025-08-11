@@ -115,7 +115,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"1.2.0",
+        "version":"1.1.1",
         "env":ENV_MODE,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }), 200
@@ -144,8 +144,7 @@ def webhook():
     pattern = str(data["pattern"]).lower()
     sig_id  = build_id(pattern, side, time_s)
 
-    # нові (необов'язкові) поля
-    bar_index_str = str(data.get("bar_index", ""))   # прийде з TV як рядок
+    bar_index_str = str(data.get("bar_index", ""))   # нові додаткові поля
     bar_time_s    = str(data.get("bar_time", time_s))
 
     if dedup_seen(sig_id):
@@ -154,7 +153,6 @@ def webhook():
 
     rotate_if_needed(CSV_PATH)
 
-    # обчислюємо затримку
     recv_dt   = datetime.now(timezone.utc)
     bar_ms    = to_int(bar_time_s)
     delay_sec = None
@@ -192,6 +190,5 @@ def webhook():
     })
     return jsonify({"status":"ok","msg":"logged","id":sig_id}), 200
 
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=5000)
