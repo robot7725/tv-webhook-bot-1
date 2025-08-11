@@ -50,6 +50,12 @@ def to_float(x):
     except Exception:
         return None
 
+def to_int(x):
+    try:
+        return int(float(x))
+    except Exception:
+        return None
+
 def to_iso8601(ts_str: str) -> str:
     try:
         ms = int(float(ts_str))
@@ -132,29 +138,59 @@ def webhook():
         return jsonify({"status":"error","msg":info}), 400
 
     symbol  = str(data["symbol"])
-    time_s  = str(data["time"])
+    time_s  = str(data["time"])  # мс від TV (час свічки)
     side    = str(data["side"]).lower()
     pattern = str(data["pattern"]).lower()
-    sig_id  = build_id(pattern, side, time_s)
+
+    # нові (необов'язкові) поля від індикатора
+    bar_index_str = str(data.get("bar_index", ""))          # може прийти як рядок
+    bar_time_s    = str(data.get("bar_time", time_s))       # час бару патерну (ms), fallback -> time_s
+
+    # dedup за часом бару патерну (якщо є); інакше — за time_s
+    sig_time_for_id = bar_time_s if data.get("bar_time") else time_s
+    sig_id = build_id(pattern, side, sig_time_for_id)
 
     if dedup_seen(sig_id):
-        techlog({"level":"info","msg":"duplicate_ignored","id":sig_id})
+        techlog({"level":"info","msg":"duplicate_ignored","id":sig_id,"symbol":symbol,"side":side})
         return jsonify({"status":"ok","msg":"ignored","id":sig_id}), 200
 
     rotate_if_needed(CSV_PATH)
 
-    time_iso = to_iso8601(time_s)
-    row = [time_s, time_iso, symbol, pattern, side, info["entry"], info["tp"], info["sl"], sig_id]
+    # обчислюємо затримку
+    recv_dt   = datetime.now(timezone.utc)
+    bar_ms    = to_int(bar_time_s)
+    delay_sec = None
+    if bar_ms is not None:
+        delay_sec = max(0, int(recv_dt.timestamp() - (bar_ms/1000)))
+
+    time_iso      = to_iso8601(time_s)
+    bar_time_iso  = to_iso8601(bar_time_s)
+    recv_time_iso = recv_dt.isoformat().replace("+00:00","Z")
+
+    # розширений CSV: часи, ідентифікатор, bar_index, delay_sec
+    row = [
+        time_s, time_iso, bar_time_s, bar_time_iso, recv_time_iso,
+        symbol, pattern, side, info["entry"], info["tp"], info["sl"],
+        sig_id, bar_index_str, delay_sec
+    ]
+
     newfile = not os.path.exists(CSV_PATH)
     try:
         with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if newfile:
-                w.writerow(["time_raw","time_iso","symbol","pattern","side","entry","tp","sl","id"])
+                w.writerow([
+                    "time_raw","time_iso","bar_time_raw","bar_time_iso","recv_time_iso",
+                    "symbol","pattern","side","entry","tp","sl",
+                    "id","bar_index","delay_sec"
+                ])
             w.writerow(row)
     except Exception as e:
         techlog({"level":"error","msg":"csv_write_failed","err":str(e),"row":row})
         return jsonify({"status":"error","msg":"csv write failed"}), 500
 
-    techlog({"level":"info","msg":"logged","id":sig_id,"symbol":symbol,"side":side})
+    techlog({
+        "level":"info","msg":"logged","id":sig_id,"symbol":symbol,"side":side,
+        "bar_index":bar_index_str,"bar_time":bar_time_iso,"recv":recv_time_iso,"delay_sec":delay_sec
+    })
     return jsonify({"status":"ok","msg":"logged","id":sig_id}), 200
