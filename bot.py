@@ -50,15 +50,9 @@ def to_float(x):
     except Exception:
         return None
 
-def to_int(x):
+def to_iso8601(ts_str: str) -> str:
     try:
-        return int(float(x))
-    except Exception:
-        return None
-
-def to_iso8601(ts_ms_str: str) -> str:
-    try:
-        ms = int(float(ts_ms_str))
+        ms = int(float(ts_str))
         return datetime.fromtimestamp(ms/1000, tz=timezone.utc).isoformat().replace("+00:00","Z")
     except Exception:
         return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -115,7 +109,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"1.1.1",
+        "version":"1.0.0",
         "env":ENV_MODE,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }), 200
@@ -125,7 +119,6 @@ def webhook():
     if not valid_sig(request):
         techlog({"level":"warn","msg":"bad_signature","headers":dict(request.headers)})
         return jsonify({"status":"error","msg":"bad signature"}), 401
-
     try:
         raw = request.get_data(cache=False, as_text=True)
         data = json.loads(raw)
@@ -139,56 +132,29 @@ def webhook():
         return jsonify({"status":"error","msg":info}), 400
 
     symbol  = str(data["symbol"])
-    time_s  = str(data["time"])  # мс від TV (час свічки)
+    time_s  = str(data["time"])
     side    = str(data["side"]).lower()
     pattern = str(data["pattern"]).lower()
     sig_id  = build_id(pattern, side, time_s)
 
-    bar_index_str = str(data.get("bar_index", ""))   # нові додаткові поля
-    bar_time_s    = str(data.get("bar_time", time_s))
-
     if dedup_seen(sig_id):
-        techlog({"level":"info","msg":"duplicate_ignored","id":sig_id,"symbol":symbol,"side":side})
+        techlog({"level":"info","msg":"duplicate_ignored","id":sig_id})
         return jsonify({"status":"ok","msg":"ignored","id":sig_id}), 200
 
     rotate_if_needed(CSV_PATH)
 
-    recv_dt   = datetime.now(timezone.utc)
-    bar_ms    = to_int(bar_time_s)
-    delay_sec = None
-    if bar_ms is not None:
-        delay_sec = max(0, int(recv_dt.timestamp() - (bar_ms/1000)))
-
-    time_iso      = to_iso8601(time_s)
-    bar_time_iso  = to_iso8601(bar_time_s)
-    recv_time_iso = recv_dt.isoformat().replace("+00:00","Z")
-
-    row = [
-        time_s, time_iso, bar_time_s, bar_time_iso, recv_time_iso,
-        symbol, pattern, side, info["entry"], info["tp"], info["sl"],
-        sig_id, bar_index_str, delay_sec
-    ]
-
+    time_iso = to_iso8601(time_s)
+    row = [time_s, time_iso, symbol, pattern, side, info["entry"], info["tp"], info["sl"], sig_id]
     newfile = not os.path.exists(CSV_PATH)
     try:
         with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if newfile:
-                w.writerow([
-                    "time_raw","time_iso","bar_time_raw","bar_time_iso","recv_time_iso",
-                    "symbol","pattern","side","entry","tp","sl",
-                    "id","bar_index","delay_sec"
-                ])
+                w.writerow(["time_raw","time_iso","symbol","pattern","side","entry","tp","sl","id"])
             w.writerow(row)
     except Exception as e:
         techlog({"level":"error","msg":"csv_write_failed","err":str(e),"row":row})
         return jsonify({"status":"error","msg":"csv write failed"}), 500
 
-    techlog({
-        "level":"info","msg":"logged","id":sig_id,"symbol":symbol,"side":side,
-        "bar_index":bar_index_str,"bar_time":bar_time_iso,"recv":recv_time_iso,"delay_sec":delay_sec
-    })
+    techlog({"level":"info","msg":"logged","id":sig_id,"symbol":symbol,"side":side})
     return jsonify({"status":"ok","msg":"logged","id":sig_id}), 200
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
