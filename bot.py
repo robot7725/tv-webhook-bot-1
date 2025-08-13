@@ -1,4 +1,4 @@
-import os, csv, hmac, hashlib, json
+import os, csv, hmac, hashlib, json, threading, time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
@@ -25,8 +25,11 @@ DEDUP = OrderedDict()
 
 def techlog(entry: dict):
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    # у файл (зберігається на диску/маунті, якщо підключений Persistent Disk)
     with open(TECH_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # у stdout для миттєвої появи в Live logs
+    print(f"[TECH] {json.dumps(entry, ensure_ascii=False)}", flush=True)
 
 def rotate_if_needed(path: str):
     try:
@@ -100,6 +103,15 @@ def dedup_seen(key: str) -> bool:
         DEDUP.popitem(last=False)
     return False
 
+# ===== heartbeat (для 24/7 моніторингу) =====
+def _heartbeat():
+    while True:
+        print(f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} alive", flush=True)
+        time.sleep(60)
+
+threading.Thread(target=_heartbeat, daemon=True).start()
+print("[BOOT] bot process started", flush=True)
+
 # ===== routes =====
 @app.route("/", methods=["GET"])
 def root():
@@ -116,6 +128,9 @@ def healthz():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # лог про прихід запиту до будь-якої перевірки
+    print(f"[WEBHOOK_RX] headers={dict(request.headers)}", flush=True)
+
     if not valid_sig(request):
         techlog({"level":"warn","msg":"bad_signature","headers":dict(request.headers)})
         return jsonify({"status":"error","msg":"bad signature"}), 401
@@ -136,6 +151,9 @@ def webhook():
     side    = str(data["side"]).lower()
     pattern = str(data["pattern"]).lower()
     sig_id  = build_id(pattern, side, time_s)
+
+    # видимий лог корисного навантаження
+    print(f"[WEBHOOK_OK] id={sig_id} data={json.dumps(data, ensure_ascii=False)}", flush=True)
 
     if dedup_seen(sig_id):
         techlog({"level":"info","msg":"duplicate_ignored","id":sig_id})
@@ -158,3 +176,7 @@ def webhook():
 
     techlog({"level":"info","msg":"logged","id":sig_id,"symbol":symbol,"side":side})
     return jsonify({"status":"ok","msg":"logged","id":sig_id}), 200
+
+# локальний запуск (у Render стартує через Gunicorn)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
