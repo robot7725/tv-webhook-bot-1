@@ -1,4 +1,4 @@
-import os, csv, hmac, hashlib, json, threading, time, re, math
+import os, csv, hmac, hashlib, json, threading, time, re
 from decimal import Decimal, ROUND_DOWN
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -18,7 +18,7 @@ app = Flask(__name__)
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
 LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
-SECRET    = os.environ.get("WEBHOOK_SECRET", "")      # якщо порожній — перевірка підпису вимкнена
+SECRET    = os.environ.get("WEBHOOK_SECRET", "")      # якщо порожній — перевірка підпису вимкнено
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
 ENV_MODE  = os.environ.get("ENV", "prod")
 MAX_KEYS  = int(os.environ.get("DEDUP_CACHE", "2000"))          # кеш ідемпотентності
@@ -26,13 +26,14 @@ ROTATE_BYTES = int(os.environ.get("ROTATE_BYTES", str(5*1024*1024)))  # 5MB
 KEEP_FILES   = int(os.environ.get("KEEP_FILES", "3"))
 
 # Binance trade settings
-TESTNET     = os.environ.get("TESTNET", "true").lower() == "true"
-API_KEY     = os.environ.get("BINANCE_API_KEY", "")
-API_SECRET  = os.environ.get("BINANCE_API_SECRET", "")
-LEVERAGE    = int(os.environ.get("LEVERAGE", "10"))
-RISK_MODE   = os.environ.get("RISK_MODE", "margin").lower()       # margin | notional
-RISK_PCT    = float(os.environ.get("RISK_PCT", "1.0"))            # % балансу
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")                   # для POST /config (опційно)
+TESTNET      = os.environ.get("TESTNET", "true").lower() == "true"
+API_KEY      = os.environ.get("BINANCE_API_KEY", "")
+API_SECRET   = os.environ.get("BINANCE_API_SECRET", "")
+LEVERAGE     = int(os.environ.get("LEVERAGE", "10"))
+RISK_MODE    = os.environ.get("RISK_MODE", "margin").lower()       # margin | notional
+RISK_PCT     = float(os.environ.get("RISK_PCT", "1.0"))            # % балансу
+ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")                   # для POST /config, /leverage
+PRESET_SYMBOLS = os.environ.get("PRESET_SYMBOLS", "")              # "1000PEPEUSDT,BTCUSDT"
 
 os.makedirs(LOG_DIR, exist_ok=True)
 CSV_PATH  = os.path.join(LOG_DIR, LOG_FILE)
@@ -45,7 +46,6 @@ def techlog(entry: dict):
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     with open(TECH_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    # дублюємо у stdout для Live logs
     print(f"[TECH] {json.dumps(entry, ensure_ascii=False)}", flush=True)
 
 def rotate_if_needed(path: str):
@@ -75,7 +75,6 @@ def to_iso8601(ts_str: str) -> str:
     Приймає epoch (сек/мс) або ISO (з/без 'Z'). Повертає ISO UTC.
     """
     s = str(ts_str).strip()
-    # число (сек/мс)
     try:
         v = float(s); iv = int(v)
         if iv > 10_000_000_000:   # мс
@@ -84,7 +83,6 @@ def to_iso8601(ts_str: str) -> str:
             return datetime.fromtimestamp(iv, tz=timezone.utc).isoformat().replace("+00:00","Z")
     except Exception:
         pass
-    # ISO
     try:
         if s.endswith("Z"): s = s[:-1] + "+00:00"
         return datetime.fromisoformat(s).astimezone(timezone.utc).isoformat().replace("+00:00","Z")
@@ -134,7 +132,7 @@ def dedup_seen(key: str) -> bool:
         DEDUP.popitem(last=False)
     return False
 
-# ===== heartbeat (для 24/7 моніторингу) =====
+# ===== heartbeat =====
 def _heartbeat():
     while True:
         print(f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} alive", flush=True)
@@ -145,34 +143,28 @@ print("[BOOT] bot process started", flush=True)
 
 # ===== Binance helpers (One-way) =====
 BINANCE = None
-SYMBOL_CACHE = {}      # symbol -> filters {stepSize,tickSize,minQty,minNotional}
-LEVERAGE_SET = set()   # symbols where leverage already set
+ONEWAY_SET = False        # кешуємо встановлення one-way, щоб не викликати щораз
+SYMBOL_CACHE = {}         # symbol -> {stepSize,tickSize,minQty,minNotional}
+LEVERAGE_SET = set()      # де вже встановили плече в цій сесії
 
 def tv_to_binance_symbol(tv_symbol: str) -> str:
-    # Напр.: 1000PEPEUSDT.P -> 1000PEPEUSDT
+    # 1000PEPEUSDT.P -> 1000PEPEUSDT
     return re.sub(r"\.P$", "", str(tv_symbol))
 
-def d_floor(x: float, step: float) -> float:
-    d = Decimal(str(x))
-    s = Decimal(str(step))
-    return float((d // s) * s)
-
 def q_floor_to_step(qty: float, step: float) -> float:
-    # Безпечно округлюємо вниз під stepSize
-    if step <= 0:
-        return qty
+    if step <= 0: return qty
     return float((Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step)))
 
-def p_round_to_tick(price: float, tick: float) -> float:
-    # Округлюємо вниз під tickSize (щоб не зловити PRICE_FILTER)
-    if tick <= 0:
-        return price
-    return float((Decimal(str(price))).quantize(Decimal(str(tick)), rounding=ROUND_DOWN))
+def p_floor_to_tick(price: float, tick: float) -> float:
+    if tick <= 0: return price
+    # округлюємо вниз до кроку тіку
+    mult = Decimal(str(price)) / Decimal(str(tick))
+    return float((mult.to_integral_value(rounding=ROUND_DOWN)) * Decimal(str(tick)))
 
 def fetch_symbol_filters(symbol: str):
     if symbol in SYMBOL_CACHE:
         return SYMBOL_CACHE[symbol]
-    info = BINANCE.exchange_info()  # кешуємо 1 раз
+    info = BINANCE.exchange_info()
     filt = {"stepSize":None, "tickSize":None, "minQty":None, "minNotional":None}
     for s in info.get("symbols", []):
         if s.get("symbol") == symbol:
@@ -192,7 +184,7 @@ def fetch_symbol_filters(symbol: str):
     raise ValueError(f"Symbol {symbol} not found in exchangeInfo")
 
 def get_available_balance_usdt() -> float:
-    bals = BINANCE.balance()  # [{asset, balance, availableBalance, ...}]
+    bals = BINANCE.balance()
     for b in bals:
         if b.get("asset") == "USDT":
             return float(b.get("availableBalance"))
@@ -203,8 +195,13 @@ def get_mark_price(symbol: str) -> float:
     return float(mp["markPrice"])
 
 def ensure_oneway_mode():
+    global ONEWAY_SET
+    if ONEWAY_SET:
+        return
     try:
-        BINANCE.change_position_mode(dualSidePosition="false")  # one-way
+        BINANCE.change_position_mode(dualSidePosition="false")
+        ONEWAY_SET = True
+        techlog({"level":"info","msg":"oneway_mode_ok"})
     except Exception as e:
         techlog({"level":"warn","msg":"change_position_mode_failed","err":str(e)})
 
@@ -214,6 +211,7 @@ def ensure_leverage(symbol: str):
     try:
         BINANCE.change_leverage(symbol=symbol, leverage=LEVERAGE)
         LEVERAGE_SET.add(symbol)
+        techlog({"level":"info","msg":"leverage_ok","symbol":symbol,"leverage":LEVERAGE})
     except Exception as e:
         techlog({"level":"warn","msg":"change_leverage_failed","symbol":symbol,"err":str(e)})
 
@@ -244,6 +242,7 @@ def compute_qty(symbol: str, price: float) -> float:
 def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float):
     """
     Маркет-вхід + два closePosition тригери (STOP/TP) для one-way.
+    Важливо: one-way і leverage не чіпаємо, якщо вже встановлені (кеш).
     """
     ensure_oneway_mode()
     ensure_leverage(symbol)
@@ -251,19 +250,15 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     price = get_mark_price(symbol)
     qty   = compute_qty(symbol, price)
 
-    # округлення SL/TP під tickSize
     filt = fetch_symbol_filters(symbol)
     tick = filt["tickSize"] or 0.0001
-    sl_r = p_round_to_tick(sl, tick)
-    tp_r = p_round_to_tick(tp, tick)
+    sl_r = p_floor_to_tick(sl, tick)
+    tp_r = p_floor_to_tick(tp, tick)
 
-    # 1) Market entry
     open_side = "BUY" if side == "long" else "SELL"
     o1 = BINANCE.new_order(symbol=symbol, side=open_side, type="MARKET", quantity=qty)
 
-    # 2) SL/TP triggers (closePosition=true) по MARK_PRICE
     exit_side = "SELL" if side == "long" else "BUY"
-
     # SL
     BINANCE.new_order(
         symbol=symbol, side=exit_side, type="STOP_MARKET",
@@ -285,6 +280,17 @@ if BINANCE_ENABLED:
     base_url = "https://testnet.binancefuture.com" if TESTNET else None
     BINANCE = UMFutures(api_key=API_KEY, api_secret=API_SECRET, base_url=base_url)
 
+    # One-way та пресет плечей на старті (для уникнення зайвих викликів на сигналі)
+    if PRESET_SYMBOLS:
+        ensure_oneway_mode()
+        for s in [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()]:
+            try:
+                BINANCE.change_leverage(symbol=s, leverage=LEVERAGE)
+                LEVERAGE_SET.add(s)
+                techlog({"level":"info","msg":"preset_leverage_ok","symbol":s,"leverage":LEVERAGE})
+            except Exception as e:
+                techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
+
 # ===== routes =====
 @app.route("/", methods=["GET"])
 def root():
@@ -294,13 +300,14 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.1.0",
+        "version":"2.2.0",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
         "risk_mode": RISK_MODE,
         "risk_pct": RISK_PCT,
         "leverage": LEVERAGE,
+        "preset_symbols": [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()],
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }), 200
 
@@ -343,16 +350,45 @@ def config():
             if lv < 1 or lv > 125:
                 return jsonify({"status":"error","msg":"leverage out of range"}), 400
             LEVERAGE = lv
-            LEVERAGE_SET.clear()  # перевстановимо при наступному ордері
+            LEVERAGE_SET.clear()  # щоб наступний сигнал перевстановив плече один раз
+            techlog({"level":"info","msg":"leverage_config_changed","leverage":LEVERAGE})
         except Exception:
             return jsonify({"status":"error","msg":"leverage must be int"}), 400
     techlog({"level":"info","msg":"config_updated","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
     return jsonify({"status":"ok","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE}), 200
 
+# ---- Manual leverage setter (no need to wait for a signal) ----
+@app.route("/leverage", methods=["POST"])
+def set_leverage_now():
+    if ADMIN_TOKEN and request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
+        return jsonify({"status":"error","msg":"unauthorized"}), 401
+    if not BINANCE_ENABLED:
+        return jsonify({"status":"error","msg":"trading_disabled"}), 400
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception:
+        return jsonify({"status":"error","msg":"bad json"}), 400
+
+    symbols = data.get("symbols")
+    leverage = int(data.get("leverage", LEVERAGE))
+    if not symbols or not isinstance(symbols, list):
+        return jsonify({"status":"error","msg":"symbols must be list"}), 400
+
+    ensure_oneway_mode()
+    done, failed = [], []
+    for sym in [str(s).upper() for s in symbols]:
+        try:
+            BINANCE.change_leverage(symbol=sym, leverage=leverage)
+            LEVERAGE_SET.add(sym)
+            done.append(sym)
+        except Exception as e:
+            failed.append({"symbol": sym, "err": str(e)})
+    techlog({"level":"info","msg":"manual_leverage_set","done":done,"failed":failed,"leverage":leverage})
+    return jsonify({"status":"ok","done":done,"failed":failed,"leverage":leverage}), 200
+
 # ---- Webhook ----
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # видимий лог запиту до будь-якої перевірки
     print(f"[WEBHOOK_RX] headers={dict(request.headers)}", flush=True)
 
     if not valid_sig(request):
@@ -376,7 +412,6 @@ def webhook():
     pattern    = str(data["pattern"]).lower()
     sig_id     = build_id(pattern, side, time_s)
 
-    # видимий лог корисного навантаження
     print(f"[WEBHOOK_OK] id={sig_id} data={json.dumps(data, ensure_ascii=False)}", flush=True)
 
     if dedup_seen(sig_id):
@@ -400,17 +435,15 @@ def webhook():
 
     techlog({"level":"info","msg":"logged","id":sig_id,"symbol":symbol_tv,"side":side})
 
-    # --- Binance trade (optional) ---
     if BINANCE_ENABLED:
         try:
             if not BINANCE:
                 raise RuntimeError("BINANCE client is not initialized")
             symbol = tv_to_binance_symbol(symbol_tv)
-            res = place_orders_oneway(symbol=symbol, side=side, entry=info["entry"], tp=info["tp"], sl=info["sl"])
-            techlog({"level":"info","msg":"trade_ok","id":sig_id,"binance":res})
+            place_orders_oneway(symbol=symbol, side=side, entry=info["entry"], tp=info["tp"], sl=info["sl"])
+            techlog({"level":"info","msg":"trade_ok","id":sig_id,"symbol":symbol})
         except Exception as e:
             techlog({"level":"error","msg":"trade_failed","id":sig_id,"err":str(e)})
-            # Не валимо вебхук: логи вже записані
     else:
         techlog({"level":"info","msg":"trading_disabled","id":sig_id})
 
