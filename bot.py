@@ -6,11 +6,26 @@ from flask import Flask, request, jsonify
 
 # ==== Binance (USDT-M Futures) ====
 BINANCE_ENABLED = os.environ.get("TRADING_ENABLED", "false").lower() == "true"
+
+UMFutures = None
+_BINANCE_IMPORT_PATH = None
 if BINANCE_ENABLED:
+    # Підтримка різних структур пакета у різних версіях binance-connector
     try:
-        from binance.um_futures import UMFutures
-    except Exception as e:
-        raise RuntimeError("Missing dependency 'binance-connector'. Add to requirements.txt") from e
+        from binance.um_futures import UMFutures as _UM
+        UMFutures = _UM
+        _BINANCE_IMPORT_PATH = "binance.um_futures"
+    except Exception as e1:
+        try:
+            from binance.lib.um_futures import UMFutures as _UM  # зустрічається у 3.12+ на py3.13
+            UMFutures = _UM
+            _BINANCE_IMPORT_PATH = "binance.lib.um_futures"
+        except Exception as e2:
+            # Якщо імпорт не вдався — не валимо весь сервіс, а просто вимикаємо торгівлю
+            print("[WARN] Cannot import UMFutures; trading disabled:",
+                  repr(e1), "|", repr(e2), flush=True)
+            BINANCE_ENABLED = False
+            UMFutures = None
 
 app = Flask(__name__)
 
@@ -149,7 +164,7 @@ LEVERAGE_SET = set()      # де вже встановили плече в ці�
 
 def tv_to_binance_symbol(tv_symbol: str) -> str:
     # 1000PEPEUSDT.P -> 1000PEPEUSDT
-    return re.sub(r"\.P$", "", str(tv_symbol))
+    return re.sub(r"\.P$", "", str(tv_symbol)).upper()
 
 def q_floor_to_step(qty: float, step: float) -> float:
     if step <= 0: return qty
@@ -157,11 +172,11 @@ def q_floor_to_step(qty: float, step: float) -> float:
 
 def p_floor_to_tick(price: float, tick: float) -> float:
     if tick <= 0: return price
-    # округлюємо вниз до кроку тіку
     mult = Decimal(str(price)) / Decimal(str(tick))
     return float((mult.to_integral_value(rounding=ROUND_DOWN)) * Decimal(str(tick)))
 
 def fetch_symbol_filters(symbol: str):
+    symbol = symbol.upper()
     if symbol in SYMBOL_CACHE:
         return SYMBOL_CACHE[symbol]
     info = BINANCE.exchange_info()
@@ -191,7 +206,7 @@ def get_available_balance_usdt() -> float:
     raise RuntimeError("USDT balance not found")
 
 def get_mark_price(symbol: str) -> float:
-    mp = BINANCE.mark_price(symbol=symbol)
+    mp = BINANCE.mark_price(symbol=symbol.upper())
     return float(mp["markPrice"])
 
 def ensure_oneway_mode():
@@ -206,6 +221,7 @@ def ensure_oneway_mode():
         techlog({"level":"warn","msg":"change_position_mode_failed","err":str(e)})
 
 def ensure_leverage(symbol: str):
+    symbol = symbol.upper()
     if symbol in LEVERAGE_SET:
         return
     try:
@@ -242,8 +258,9 @@ def compute_qty(symbol: str, price: float) -> float:
 def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float):
     """
     Маркет-вхід + два closePosition тригери (STOP/TP) для one-way.
-    Важливо: one-way і leverage не чіпаємо, якщо вже встановлені (кеш).
+    One-way/leverage ставимо один раз на символ.
     """
+    symbol = symbol.upper()
     ensure_oneway_mode()
     ensure_leverage(symbol)
 
@@ -276,11 +293,12 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
 # ===== Binance init =====
 BINANCE = None
-if BINANCE_ENABLED:
-    base_url = "https://testnet.binancefuture.com" if TESTNET else None
+if BINANCE_ENABLED and UMFutures:
+    base_url = "https://testnet.binancefuture.com" if TESTNET else None  # None = прод
     BINANCE = UMFutures(api_key=API_KEY, api_secret=API_SECRET, base_url=base_url)
+    techlog({"level":"info","msg":"binance_client_ready","import_path":_BINANCE_IMPORT_PATH,"testnet":TESTNET})
 
-    # One-way та пресет плечей на старті (для уникнення зайвих викликів на сигналі)
+    # One-way та пресет плечей на старті (щоб не робити зайвих викликів на сигналі)
     if PRESET_SYMBOLS:
         ensure_oneway_mode()
         for s in [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()]:
@@ -300,7 +318,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.2.0",
+        "version":"2.2.1",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -308,6 +326,7 @@ def healthz():
         "risk_pct": RISK_PCT,
         "leverage": LEVERAGE,
         "preset_symbols": [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()],
+        "binance_import_path": _BINANCE_IMPORT_PATH,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }), 200
 
@@ -362,7 +381,7 @@ def config():
 def set_leverage_now():
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
         return jsonify({"status":"error","msg":"unauthorized"}), 401
-    if not BINANCE_ENABLED:
+    if not BINANCE_ENABLED or not BINANCE:
         return jsonify({"status":"error","msg":"trading_disabled"}), 400
     try:
         data = request.get_json(force=True, silent=False)
@@ -435,10 +454,8 @@ def webhook():
 
     techlog({"level":"info","msg":"logged","id":sig_id,"symbol":symbol_tv,"side":side})
 
-    if BINANCE_ENABLED:
+    if BINANCE_ENABLED and BINANCE:
         try:
-            if not BINANCE:
-                raise RuntimeError("BINANCE client is not initialized")
             symbol = tv_to_binance_symbol(symbol_tv)
             place_orders_oneway(symbol=symbol, side=side, entry=info["entry"], tp=info["tp"], sl=info["sl"])
             techlog({"level":"info","msg":"trade_ok","id":sig_id,"symbol":symbol})
