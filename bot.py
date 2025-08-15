@@ -17,11 +17,11 @@ if BINANCE_ENABLED:
         _BINANCE_IMPORT_PATH = "binance.um_futures"
     except Exception as e1:
         try:
-            from binance.lib.um_futures import UMFutures as _UM  # зустрічається у 3.12+ на py3.13
+            # інколи експортують тут (деякі збірки/версії)
+            from binance.lib.um_futures import UMFutures as _UM
             UMFutures = _UM
             _BINANCE_IMPORT_PATH = "binance.lib.um_futures"
         except Exception as e2:
-            # Якщо імпорт не вдався — не валимо весь сервіс, а просто вимикаємо торгівлю
             print("[WARN] Cannot import UMFutures; trading disabled:",
                   repr(e1), "|", repr(e2), flush=True)
             BINANCE_ENABLED = False
@@ -33,10 +33,10 @@ app = Flask(__name__)
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
 LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
-SECRET    = os.environ.get("WEBHOOK_SECRET", "")      # якщо порожній — перевірка підпису вимкнено
+SECRET    = os.environ.get("WEBHOOK_SECRET", "")
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
 ENV_MODE  = os.environ.get("ENV", "prod")
-MAX_KEYS  = int(os.environ.get("DEDUP_CACHE", "2000"))          # кеш ідемпотентності
+MAX_KEYS  = int(os.environ.get("DEDUP_CACHE", "2000"))
 ROTATE_BYTES = int(os.environ.get("ROTATE_BYTES", str(5*1024*1024)))  # 5MB
 KEEP_FILES   = int(os.environ.get("KEEP_FILES", "3"))
 
@@ -47,7 +47,7 @@ API_SECRET   = os.environ.get("BINANCE_API_SECRET", "")
 LEVERAGE     = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE    = os.environ.get("RISK_MODE", "margin").lower()       # margin | notional
 RISK_PCT     = float(os.environ.get("RISK_PCT", "1.0"))            # % балансу
-ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")                   # для POST /config, /leverage
+ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 PRESET_SYMBOLS = os.environ.get("PRESET_SYMBOLS", "")              # "1000PEPEUSDT,BTCUSDT"
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -86,9 +86,7 @@ def to_float(x):
         return None
 
 def to_iso8601(ts_str: str) -> str:
-    """
-    Приймає epoch (сек/мс) або ISO (з/без 'Z'). Повертає ISO UTC.
-    """
+    """Приймає epoch (сек/мс) або ISO (з/без 'Z'). Повертає ISO UTC."""
     s = str(ts_str).strip()
     try:
         v = float(s); iv = int(v)
@@ -158,7 +156,7 @@ print("[BOOT] bot process started", flush=True)
 
 # ===== Binance helpers (One-way) =====
 BINANCE = None
-ONEWAY_SET = False        # кешуємо встановлення one-way, щоб не викликати щораз
+ONEWAY_SET = False
 SYMBOL_CACHE = {}         # symbol -> {stepSize,tickSize,minQty,minNotional}
 LEVERAGE_SET = set()      # де вже встановили плече в цій сесії
 
@@ -256,10 +254,7 @@ def compute_qty(symbol: str, price: float) -> float:
     return qty
 
 def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float):
-    """
-    Маркет-вхід + два closePosition тригери (STOP/TP) для one-way.
-    One-way/leverage ставимо один раз на символ.
-    """
+    """Маркет-вхід + два closePosition тригери (STOP/TP) для one-way."""
     symbol = symbol.upper()
     ensure_oneway_mode()
     ensure_leverage(symbol)
@@ -288,26 +283,36 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     )
 
     print(f"[TRADE] {symbol} {side} qty={qty} price={price} tp={tp_r} sl={sl_r}", flush=True)
-    techlog({"level":"info","msg":"binance_orders_placed","symbol":symbol,"qty":qty,"open_side":open_side,"tp":tp_r,"sl":sl_r,"price":price,"mode":"oneway"})
+    techlog({"level":"info","msg":"binance_orders_placed",
+             "symbol":symbol,"qty":qty,"open_side":open_side,"tp":tp_r,"sl":sl_r,
+             "price":price,"mode":"oneway"})
     return {"qty":qty, "price":price, "tp":tp_r, "sl":sl_r, "open_order":o1}
 
 # ===== Binance init =====
 BINANCE = None
 if BINANCE_ENABLED and UMFutures:
-    base_url = "https://testnet.binancefuture.com" if TESTNET else None  # None = прод
-    BINANCE = UMFutures(api_key=API_KEY, api_secret=API_SECRET, base_url=base_url)
-    techlog({"level":"info","msg":"binance_client_ready","import_path":_BINANCE_IMPORT_PATH,"testnet":TESTNET})
-
-    # One-way та пресет плечей на старті (щоб не робити зайвих викликів на сигналі)
-    if PRESET_SYMBOLS:
-        ensure_oneway_mode()
-        for s in [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()]:
-            try:
-                BINANCE.change_leverage(symbol=s, leverage=LEVERAGE)
-                LEVERAGE_SET.add(s)
-                techlog({"level":"info","msg":"preset_leverage_ok","symbol":s,"leverage":LEVERAGE})
-            except Exception as e:
-                techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
+    try:
+        if TESTNET:
+            BINANCE = UMFutures(key=API_KEY, secret=API_SECRET,
+                                base_url="https://testnet.binancefuture.com")
+        else:
+            BINANCE = UMFutures(key=API_KEY, secret=API_SECRET)
+        techlog({"level":"info","msg":"binance_client_ready",
+                 "import_path":_BINANCE_IMPORT_PATH,"testnet":TESTNET})
+        # Пресет режими
+        if PRESET_SYMBOLS:
+            ensure_oneway_mode()
+            for s in [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()]:
+                try:
+                    BINANCE.change_leverage(symbol=s, leverage=LEVERAGE)
+                    LEVERAGE_SET.add(s)
+                    techlog({"level":"info","msg":"preset_leverage_ok","symbol":s,"leverage":LEVERAGE})
+                except Exception as e:
+                    techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
+    except Exception as e:
+        techlog({"level":"warn","msg":"binance_client_init_failed","err":str(e)})
+        BINANCE_ENABLED = False
+        BINANCE = None
 
 # ===== routes =====
 @app.route("/", methods=["GET"])
@@ -318,7 +323,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.2.1",
+        "version":"2.2.2",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -343,7 +348,7 @@ def config():
             "trading_enabled": BINANCE_ENABLED,
             "testnet": TESTNET
         }), 200
-    # POST
+    # POST (захист)
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
         return jsonify({"status":"error","msg":"unauthorized"}), 401
     try:
@@ -369,14 +374,15 @@ def config():
             if lv < 1 or lv > 125:
                 return jsonify({"status":"error","msg":"leverage out of range"}), 400
             LEVERAGE = lv
-            LEVERAGE_SET.clear()  # щоб наступний сигнал перевстановив плече один раз
+            LEVERAGE_SET.clear()
             techlog({"level":"info","msg":"leverage_config_changed","leverage":LEVERAGE})
         except Exception:
             return jsonify({"status":"error","msg":"leverage must be int"}), 400
-    techlog({"level":"info","msg":"config_updated","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
+    techlog({"level":"info","msg":"config_updated",
+             "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
     return jsonify({"status":"ok","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE}), 200
 
-# ---- Manual leverage setter (no need to wait for a signal) ----
+# ---- Manual leverage setter
 @app.route("/leverage", methods=["POST"])
 def set_leverage_now():
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
