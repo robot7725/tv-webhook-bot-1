@@ -211,16 +211,37 @@ def get_mark_price(symbol: str) -> float:
     mp = BINANCE.mark_price(symbol=symbol.upper())
     return float(mp["markPrice"])
 
+# ---- Patched ensure_oneway_mode ----
 def ensure_oneway_mode():
+    """Гарантуємо one-way режим. -4059 ('No need to change position side')
+    вважаємо успішним станом і логуюємо як 'already'."""
     global ONEWAY_SET
     if ONEWAY_SET:
         return
     try:
+        # Попередня перевірка, якщо метод є у збірці
+        try:
+            st = BINANCE.get_position_mode()  # може бути відсутній у деяких версіях конектора
+            dual = str(st.get("dualSidePosition", "false")).lower() in ("true", "1")
+            if not dual:
+                ONEWAY_SET = True
+                techlog({"level":"info","msg":"oneway_mode_ok","source":"precheck"})
+                return
+        except Exception:
+            pass
+
+        # Встановлення one-way
         BINANCE.change_position_mode(dualSidePosition="false")
         ONEWAY_SET = True
         techlog({"level":"info","msg":"oneway_mode_ok"})
     except Exception as e:
-        techlog({"level":"warn","msg":"change_position_mode_failed","err":str(e)})
+        msg = str(e)
+        # -4059 / "No need to change position side." — режим уже one-way
+        if "-4059" in msg or "no need to change position side" in msg.lower() or "not modified" in msg.lower():
+            ONEWAY_SET = True
+            techlog({"level":"info","msg":"oneway_mode_already","detail":msg})
+        else:
+            techlog({"level":"warn","msg":"change_position_mode_failed","err":msg})
 
 def ensure_leverage(symbol: str):
     symbol = symbol.upper()
@@ -415,7 +436,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.3.0",
+        "version":"2.3.1",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
