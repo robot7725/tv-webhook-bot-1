@@ -17,7 +17,6 @@ if BINANCE_ENABLED:
         _BINANCE_IMPORT_PATH = "binance.um_futures"
     except Exception as e1:
         try:
-            # інколи експортують тут (деякі збірки/версії)
             from binance.lib.um_futures import UMFutures as _UM
             UMFutures = _UM
             _BINANCE_IMPORT_PATH = "binance.lib.um_futures"
@@ -31,7 +30,7 @@ app = Flask(__name__)
 
 # ===== ENV / config =====
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
-LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")
+LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")  # змініть на inside.csv за бажанням
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
 SECRET    = os.environ.get("WEBHOOK_SECRET", "")
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
@@ -50,12 +49,17 @@ RISK_PCT     = float(os.environ.get("RISK_PCT", "1.0"))            # % бала�
 ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 PRESET_SYMBOLS = os.environ.get("PRESET_SYMBOLS", "")              # "1000PEPEUSDT,BTCUSDT"
 
+# Bracket monitor settings
+CANCEL_ORPHANS   = os.environ.get("CANCEL_ORPHANS", "true").lower() == "true"
+BRACKET_POLL_SEC = float(os.environ.get("BRACKET_POLL_SEC", "1"))
+
 os.makedirs(LOG_DIR, exist_ok=True)
 CSV_PATH  = os.path.join(LOG_DIR, LOG_FILE)
 TECH_PATH = os.path.join(LOG_DIR, TECH_LOG)
 
 # ===== utils =====
 DEDUP = OrderedDict()
+BRACKETS = {}  # symbol -> {"side": "long|short", "tp_id": int, "sl_id": int, "ts": iso}
 
 def techlog(entry: dict):
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -253,11 +257,86 @@ def compute_qty(symbol: str, price: float) -> float:
         raise RuntimeError("Computed qty <= 0. Increase RISK_PCT or leverage.")
     return qty
 
+def _get_order_status(symbol: str, order_id: int) -> str:
+    """Повертає статус ордера ('NEW','FILLED','CANCELED',...)."""
+    try:
+        od = BINANCE.get_order(symbol=symbol, orderId=order_id)
+    except Exception:
+        # деякі збірки використовують інші назви
+        od = BINANCE.query_order(symbol=symbol, orderId=order_id)
+    return str(od.get("status", "")).upper()
+
+def _cancel_order_silent(symbol: str, order_id: int, reason: str):
+    if not order_id:
+        return
+    try:
+        BINANCE.cancel_order(symbol=symbol, orderId=order_id)
+        techlog({"level":"info","msg":"cancel_order","symbol":symbol,"order_id":order_id,"reason":reason})
+    except Exception as e:
+        techlog({"level":"warn","msg":"cancel_order_failed","symbol":symbol,"order_id":order_id,"err":str(e)})
+
+def _position_amt(symbol: str) -> float:
+    """One-way: повертає абсолютний розмір позиції за символом."""
+    try:
+        data = BINANCE.position_risk(symbol=symbol)
+    except Exception:
+        data = BINANCE.position_information(symbol=symbol)
+    amt = 0.0
+    for p in data:
+        if p.get("symbol") == symbol:
+            try:
+                amt = float(p.get("positionAmt") or p.get("positionAmt".upper(), 0.0))
+            except Exception:
+                amt = 0.0
+            break
+    return abs(amt)
+
+def _bracket_monitor():
+    """Фоновий потік: якщо TP або SL виконано — скасовуємо «брата».
+       Якщо позиція 0 — прибираємо всі open orders по символу."""
+    while True:
+        try:
+            for symbol, b in list(BRACKETS.items()):
+                tp_id = b.get("tp_id")
+                sl_id = b.get("sl_id")
+
+                tp_st = _get_order_status(symbol, tp_id) if tp_id else ""
+                sl_st = _get_order_status(symbol, sl_id) if sl_id else ""
+
+                if tp_st == "FILLED" and sl_st not in ("CANCELED","FILLED","EXPIRED"):
+                    _cancel_order_silent(symbol, sl_id, reason="sibling_tp_filled")
+                    BRACKETS.pop(symbol, None)
+                    continue
+
+                if sl_st == "FILLED" and tp_st not in ("CANCELED","FILLED","EXPIRED"):
+                    _cancel_order_silent(symbol, tp_id, reason="sibling_sl_filled")
+                    BRACKETS.pop(symbol, None)
+                    continue
+
+                # Catch-all: позиція закрита — прибрати всі відкриті ордери
+                if _position_amt(symbol) == 0.0:
+                    try:
+                        BINANCE.cancel_all_open_orders(symbol=symbol)
+                        techlog({"level":"info","msg":"cancel_all_on_zero_pos","symbol":symbol})
+                    except Exception as e:
+                        techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":str(e)})
+                    BRACKETS.pop(symbol, None)
+        except Exception as e:
+            techlog({"level":"warn","msg":"bracket_monitor_error","err":str(e)})
+        time.sleep(BRACKET_POLL_SEC)
+
 def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float):
     """Маркет-вхід + два closePosition тригери (STOP/TP) для one-way."""
     symbol = symbol.upper()
     ensure_oneway_mode()
     ensure_leverage(symbol)
+
+    # Якщо вже є активна «скоба» по символу — акуратно приберемо її
+    if symbol in BRACKETS:
+        b = BRACKETS.get(symbol, {})
+        _cancel_order_silent(symbol, b.get("tp_id"), reason="replace_bracket_tp")
+        _cancel_order_silent(symbol, b.get("sl_id"), reason="replace_bracket_sl")
+        BRACKETS.pop(symbol, None)
 
     price = get_mark_price(symbol)
     qty   = compute_qty(symbol, price)
@@ -272,19 +351,28 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
     exit_side = "SELL" if side == "long" else "BUY"
     # SL
-    BINANCE.new_order(
+    oSL = BINANCE.new_order(
         symbol=symbol, side=exit_side, type="STOP_MARKET",
         stopPrice=sl_r, closePosition="true", workingType="MARK_PRICE"
     )
     # TP
-    BINANCE.new_order(
+    oTP = BINANCE.new_order(
         symbol=symbol, side=exit_side, type="TAKE_PROFIT_MARKET",
         stopPrice=tp_r, closePosition="true", workingType="MARK_PRICE"
     )
 
+    # Запам'ятати скобу
+    BRACKETS[symbol] = {
+        "side": side,
+        "tp_id": int(oTP.get("orderId")),
+        "sl_id": int(oSL.get("orderId")),
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    }
+
     print(f"[TRADE] {symbol} {side} qty={qty} price={price} tp={tp_r} sl={sl_r}", flush=True)
     techlog({"level":"info","msg":"binance_orders_placed",
              "symbol":symbol,"qty":qty,"open_side":open_side,"tp":tp_r,"sl":sl_r,
+             "tp_id":BRACKETS[symbol]["tp_id"],"sl_id":BRACKETS[symbol]["sl_id"],
              "price":price,"mode":"oneway"})
     return {"qty":qty, "price":price, "tp":tp_r, "sl":sl_r, "open_order":o1}
 
@@ -309,6 +397,10 @@ if BINANCE_ENABLED and UMFutures:
                     techlog({"level":"info","msg":"preset_leverage_ok","symbol":s,"leverage":LEVERAGE})
                 except Exception as e:
                     techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
+        # Запуск монітора «скоб»
+        if CANCEL_ORPHANS:
+            threading.Thread(target=_bracket_monitor, daemon=True).start()
+            techlog({"level":"info","msg":"bracket_monitor_started","poll_sec":BRACKET_POLL_SEC})
     except Exception as e:
         techlog({"level":"warn","msg":"binance_client_init_failed","err":str(e)})
         BINANCE_ENABLED = False
@@ -323,7 +415,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.2.2",
+        "version":"2.3.0",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -332,6 +424,8 @@ def healthz():
         "leverage": LEVERAGE,
         "preset_symbols": [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()],
         "binance_import_path": _BINANCE_IMPORT_PATH,
+        "cancel_orphans": CANCEL_ORPHANS,
+        "poll_sec": BRACKET_POLL_SEC,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }), 200
 
