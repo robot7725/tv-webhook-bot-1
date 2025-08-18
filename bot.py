@@ -40,9 +40,13 @@ ROTATE_BYTES = int(os.environ.get("ROTATE_BYTES", str(5*1024*1024)))  # 5MB
 KEEP_FILES   = int(os.environ.get("KEEP_FILES", "3"))
 
 # Binance trade settings
-TESTNET      = os.environ.get("TESTNET", "true").lower() == "true"
-API_KEY      = os.environ.get("BINANCE_API_KEY", "")
-API_SECRET   = os.environ.get("BINANCE_API_SECRET", "")
+TESTNET         = os.environ.get("TESTNET", "true").lower() == "true"
+# ---- роздільні ключі для mainnet/testnet ----
+API_KEY_MAIN    = os.environ.get("BINANCE_API_KEY", "")
+API_SECRET_MAIN = os.environ.get("BINANCE_API_SECRET", "")
+API_KEY_TEST    = os.environ.get("BINANCE_API_KEY_TEST", "")
+API_SECRET_TEST = os.environ.get("BINANCE_API_SECRET_TEST", "")
+
 LEVERAGE     = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE    = os.environ.get("RISK_MODE", "margin").lower()       # margin | notional
 RISK_PCT     = float(os.environ.get("RISK_PCT", "1.0"))            # % балансу
@@ -279,7 +283,7 @@ def compute_qty(symbol: str, price: float) -> float:
     return qty
 
 def _get_order_status(symbol: str, order_id: int) -> str:
-    """Повертає статус ордера ('NEW','FILLED','CANCELED',...)."""
+    """Повертає статус ордера ('NEW','FILLED','CANCELED','...')."""
     try:
         od = BINANCE.get_order(symbol=symbol, orderId=order_id)
     except Exception:
@@ -402,10 +406,16 @@ BINANCE = None
 if BINANCE_ENABLED and UMFutures:
     try:
         if TESTNET:
-            BINANCE = UMFutures(key=API_KEY, secret=API_SECRET,
-                                base_url="https://testnet.binancefuture.com")
+            BINANCE = UMFutures(
+                key=API_KEY_TEST,
+                secret=API_SECRET_TEST,
+                base_url="https://testnet.binancefuture.com"
+            )
         else:
-            BINANCE = UMFutures(key=API_KEY, secret=API_SECRET)
+            BINANCE = UMFutures(
+                key=API_KEY_MAIN,
+                secret=API_SECRET_MAIN
+            )
         techlog({"level":"info","msg":"binance_client_ready",
                  "import_path":_BINANCE_IMPORT_PATH,"testnet":TESTNET})
         # Пресет режими
