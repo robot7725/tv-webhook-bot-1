@@ -10,7 +10,6 @@ BINANCE_ENABLED = os.environ.get("TRADING_ENABLED", "false").lower() == "true"
 UMFutures = None
 _BINANCE_IMPORT_PATH = None
 if BINANCE_ENABLED:
-    # Підтримка різних структур пакета у різних версіях binance-connector
     try:
         from binance.um_futures import UMFutures as _UM
         UMFutures = _UM
@@ -21,8 +20,7 @@ if BINANCE_ENABLED:
             UMFutures = _UM
             _BINANCE_IMPORT_PATH = "binance.lib.um_futures"
         except Exception as e2:
-            print("[WARN] Cannot import UMFutures; trading disabled:",
-                  repr(e1), "|", repr(e2), flush=True)
+            print("[WARN] Cannot import UMFutures; trading disabled:", repr(e1), "|", repr(e2), flush=True)
             BINANCE_ENABLED = False
             UMFutures = None
 
@@ -32,6 +30,7 @@ app = Flask(__name__)
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
 LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")  # змініть на inside.csv за бажанням
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
+EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")  # <— НОВЕ: файл з виконаннями
 SECRET    = os.environ.get("WEBHOOK_SECRET", "")
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
 ENV_MODE  = os.environ.get("ENV", "prod")
@@ -41,7 +40,6 @@ KEEP_FILES   = int(os.environ.get("KEEP_FILES", "3"))
 
 # Binance trade settings
 TESTNET         = os.environ.get("TESTNET", "true").lower() == "true"
-# ---- роздільні ключі для mainnet/testnet ----
 API_KEY_MAIN    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET_MAIN = os.environ.get("BINANCE_API_SECRET", "")
 API_KEY_TEST    = os.environ.get("BINANCE_API_KEY_TEST", "")
@@ -58,12 +56,14 @@ CANCEL_ORPHANS   = os.environ.get("CANCEL_ORPHANS", "true").lower() == "true"
 BRACKET_POLL_SEC = float(os.environ.get("BRACKET_POLL_SEC", "1"))
 
 os.makedirs(LOG_DIR, exist_ok=True)
-CSV_PATH  = os.path.join(LOG_DIR, LOG_FILE)
-TECH_PATH = os.path.join(LOG_DIR, TECH_LOG)
+CSV_PATH   = os.path.join(LOG_DIR, LOG_FILE)
+TECH_PATH  = os.path.join(LOG_DIR, TECH_LOG)
+EXEC_PATH  = os.path.join(LOG_DIR, EXEC_LOG)
 
 # ===== utils =====
 DEDUP = OrderedDict()
-BRACKETS = {}  # symbol -> {"side": "long|short", "tp_id": int, "sl_id": int, "ts": iso}
+# symbol -> {...} тепер містить також 'id' (signal_id) та 'open_order_id'
+BRACKETS = {}  # {"BTCUSDT": {"id":sig, "side":"long","tp_id":..., "sl_id":..., "open_order_id":..., "ts":iso}}
 
 def techlog(entry: dict):
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -87,6 +87,31 @@ def rotate_if_needed(path: str):
     except Exception as e:
         techlog({"level":"warn","msg":"rotate_failed","err":str(e),"path":path})
 
+def _ensure_exec_header():
+    if not os.path.exists(EXEC_PATH) or os.path.getsize(EXEC_PATH) == 0:
+        with open(EXEC_PATH, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["signal_id","event","time","price","qty","commission","commission_asset","realized_pnl","symbol","side","order_id"])
+
+def _exec_write_row(row):
+    rotate_if_needed(EXEC_PATH)
+    _ensure_exec_header()
+    with open(EXEC_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(row)
+
+def exec_log(signal_id: str, event: str, iso_time: str, price, qty, commission, commission_asset, realized_pnl, symbol: str, side: str, order_id: int):
+    """Запис у executions.csv (OPEN/CLOSE). Числові поля можуть бути None."""
+    _exec_write_row([
+        signal_id, event, iso_time,
+        price if price is not None else "", 
+        qty if qty is not None else "",
+        commission if commission is not None else "",
+        commission_asset or "",
+        realized_pnl if realized_pnl is not None else "",
+        symbol, side, order_id
+    ])
+
 def to_float(x):
     try:
         return float(x)
@@ -94,7 +119,6 @@ def to_float(x):
         return None
 
 def to_iso8601(ts_str: str) -> str:
-    """Приймає epoch (сек/мс) або ISO (з/без 'Z'). Повертає ISO UTC."""
     s = str(ts_str).strip()
     try:
         v = float(s); iv = int(v)
@@ -166,10 +190,9 @@ print("[BOOT] bot process started", flush=True)
 BINANCE = None
 ONEWAY_SET = False
 SYMBOL_CACHE = {}         # symbol -> {stepSize,tickSize,minQty,minNotional}
-LEVERAGE_SET = set()      # де вже встановили плече в цій сесії
+LEVERAGE_SET = set()
 
 def tv_to_binance_symbol(tv_symbol: str) -> str:
-    # 1000PEPEUSDT.P -> 1000PEPEUSDT
     return re.sub(r"\.P$", "", str(tv_symbol)).upper()
 
 def q_floor_to_step(qty: float, step: float) -> float:
@@ -192,8 +215,7 @@ def fetch_symbol_filters(symbol: str):
             for f in s.get("filters", []):
                 t = f.get("filterType")
                 if t == "LOT_SIZE":
-                    filt["stepSize"] = float(f["stepSize"])
-                    filt["minQty"] = float(f["minQty"])
+                    filt["stepSize"] = float(f["stepSize"]); filt["minQty"] = float(f["minQty"])
                 elif t == "PRICE_FILTER":
                     filt["tickSize"] = float(f["tickSize"])
                 elif t in ("MIN_NOTIONAL","NOTIONAL"):
@@ -215,17 +237,13 @@ def get_mark_price(symbol: str) -> float:
     mp = BINANCE.mark_price(symbol=symbol.upper())
     return float(mp["markPrice"])
 
-# ---- Patched ensure_oneway_mode ----
 def ensure_oneway_mode():
-    """Гарантуємо one-way режим. -4059 ('No need to change position side')
-    вважаємо успішним станом і логуюємо як 'already'."""
     global ONEWAY_SET
     if ONEWAY_SET:
         return
     try:
-        # Попередня перевірка, якщо метод є у збірці
         try:
-            st = BINANCE.get_position_mode()  # може бути відсутній у деяких версіях конектора
+            st = BINANCE.get_position_mode()
             dual = str(st.get("dualSidePosition", "false")).lower() in ("true", "1")
             if not dual:
                 ONEWAY_SET = True
@@ -233,14 +251,11 @@ def ensure_oneway_mode():
                 return
         except Exception:
             pass
-
-        # Встановлення one-way
         BINANCE.change_position_mode(dualSidePosition="false")
         ONEWAY_SET = True
         techlog({"level":"info","msg":"oneway_mode_ok"})
     except Exception as e:
         msg = str(e)
-        # -4059 / "No need to change position side." — режим уже one-way
         if "-4059" in msg or "no need to change position side" in msg.lower() or "not modified" in msg.lower():
             ONEWAY_SET = True
             techlog({"level":"info","msg":"oneway_mode_already","detail":msg})
@@ -266,30 +281,60 @@ def compute_qty(symbol: str, price: float) -> float:
     else:
         notional = bal * (RISK_PCT / 100.0)
     qty_raw = notional / price
-
     filt = fetch_symbol_filters(symbol)
     step = filt["stepSize"] or 0.001
     min_qty = filt["minQty"] or 0.0
     min_not = filt["minNotional"] or 0.0
-
     qty = q_floor_to_step(qty_raw, step)
     if min_qty and qty < min_qty:
         qty = min_qty
     if min_not and (qty * price) < min_not:
         qty = q_floor_to_step((min_not / price), step) or min_qty
-
     if qty <= 0:
         raise RuntimeError("Computed qty <= 0. Increase RISK_PCT or leverage.")
     return qty
 
 def _get_order_status(symbol: str, order_id: int) -> str:
-    """Повертає статус ордера ('NEW','FILLED','CANCELED','...')."""
     try:
         od = BINANCE.get_order(symbol=symbol, orderId=order_id)
     except Exception:
-        # деякі збірки використовують інші назви
         od = BINANCE.query_order(symbol=symbol, orderId=order_id)
     return str(od.get("status", "")).upper()
+
+# ===== ЗБІР ТРЕЙДІВ ДЛЯ ОРДЕРА (для OPEN/CLOSE логів) =====
+def _fetch_trades_for_order(symbol: str, order_id: int):
+    """Повертає (vwap_price, total_qty, commission_sum, commission_asset, realized_pnl_sum)."""
+    try:
+        # У різних збірках назва може відрізнятись; найчастіше: user_trades
+        trades = BINANCE.user_trades(symbol=symbol)
+    except Exception:
+        try:
+            trades = BINANCE.get_account_trades(symbol=symbol)
+        except Exception as e:
+            techlog({"level":"warn","msg":"user_trades_failed","symbol":symbol,"order_id":order_id,"err":str(e)})
+            return None, None, None, "USDT", None
+    # Фільтруємо по orderId
+    flist = [t for t in trades if int(t.get("orderId", 0)) == int(order_id)]
+    if not flist:
+        return None, None, None, "USDT", None
+    qty_sum = 0.0
+    px_qty_sum = 0.0
+    fee_sum = 0.0
+    pnl_sum = 0.0
+    fee_asset = "USDT"
+    for t in flist:
+        p = to_float(t.get("price")); q = to_float(t.get("qty"))
+        fee = to_float(t.get("commission")) or 0.0
+        fee_asset = t.get("commissionAsset") or fee_asset
+        rpn = to_float(t.get("realizedPnl"))
+        if p is not None and q is not None:
+            qty_sum += q
+            px_qty_sum += p * q
+        if rpn is not None:
+            pnl_sum += rpn
+        fee_sum += fee
+    vwap = (px_qty_sum / qty_sum) if qty_sum else None
+    return vwap, (qty_sum or None), (fee_sum or None), fee_asset, (pnl_sum if pnl_sum != 0.0 else None)
 
 def _cancel_order_silent(symbol: str, order_id: int, reason: str):
     if not order_id:
@@ -301,7 +346,6 @@ def _cancel_order_silent(symbol: str, order_id: int, reason: str):
         techlog({"level":"warn","msg":"cancel_order_failed","symbol":symbol,"order_id":order_id,"err":str(e)})
 
 def _position_amt(symbol: str) -> float:
-    """One-way: повертає абсолютний розмір позиції за символом."""
     try:
         data = BINANCE.position_risk(symbol=symbol)
     except Exception:
@@ -317,28 +361,34 @@ def _position_amt(symbol: str) -> float:
     return abs(amt)
 
 def _bracket_monitor():
-    """Фоновий потік: якщо TP або SL виконано — скасовуємо «брата».
-       Якщо позиція 0 — прибираємо всі open orders по символу."""
+    """Фоновий потік: коли TP/SL стає FILLED — логувати CLOSE і прибрати «брата»."""
     while True:
         try:
             for symbol, b in list(BRACKETS.items()):
+                sid   = b.get("id")
+                side  = b.get("side")
                 tp_id = b.get("tp_id")
                 sl_id = b.get("sl_id")
 
                 tp_st = _get_order_status(symbol, tp_id) if tp_id else ""
                 sl_st = _get_order_status(symbol, sl_id) if sl_id else ""
 
-                if tp_st == "FILLED" and sl_st not in ("CANCELED","FILLED","EXPIRED"):
+                if tp_st == "FILLED":
+                    vwap, qty, fee, fee_asset, rpn = _fetch_trades_for_order(symbol, tp_id)
+                    iso = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+                    exec_log(sid, "CLOSE", iso, vwap, qty, fee, fee_asset, rpn, symbol, side, tp_id)
                     _cancel_order_silent(symbol, sl_id, reason="sibling_tp_filled")
                     BRACKETS.pop(symbol, None)
                     continue
 
-                if sl_st == "FILLED" and tp_st not in ("CANCELED","FILLED","EXPIRED"):
+                if sl_st == "FILLED":
+                    vwap, qty, fee, fee_asset, rpn = _fetch_trades_for_order(symbol, sl_id)
+                    iso = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+                    exec_log(sid, "CLOSE", iso, vwap, qty, fee, fee_asset, rpn, symbol, side, sl_id)
                     _cancel_order_silent(symbol, tp_id, reason="sibling_sl_filled")
                     BRACKETS.pop(symbol, None)
                     continue
 
-                # Catch-all: позиція закрита — прибрати всі відкриті ордери
                 if _position_amt(symbol) == 0.0:
                     try:
                         BINANCE.cancel_all_open_orders(symbol=symbol)
@@ -350,13 +400,12 @@ def _bracket_monitor():
             techlog({"level":"warn","msg":"bracket_monitor_error","err":str(e)})
         time.sleep(BRACKET_POLL_SEC)
 
-def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float):
-    """Маркет-вхід + два closePosition тригери (STOP/TP) для one-way."""
+def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
+    """Маркет-вхід + два closePosition тригери (STOP/TP) для one-way (логування OPEN/CLOSE)."""
     symbol = symbol.upper()
     ensure_oneway_mode()
     ensure_leverage(symbol)
 
-    # Якщо вже є активна «скоба» по символу — акуратно приберемо її
     if symbol in BRACKETS:
         b = BRACKETS.get(symbol, {})
         _cancel_order_silent(symbol, b.get("tp_id"), reason="replace_bracket_tp")
@@ -373,24 +422,31 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
     open_side = "BUY" if side == "long" else "SELL"
     o1 = BINANCE.new_order(symbol=symbol, side=open_side, type="MARKET", quantity=qty)
+    open_id = int(o1.get("orderId"))
+
+    # Почекати коротко і зафіксувати реальні філи (VWAP/fee)
+    # (короткий полінг; не змінює логіку, лише збирає дані)
+    for _ in range(8):  # ~ до ~2-3с загалом
+        st = _get_order_status(symbol, open_id)
+        if st == "FILLED":
+            break
+        time.sleep(0.3)
+    vwap_open, qty_open, fee_open, fee_asset_open, _rpn_ignored = _fetch_trades_for_order(symbol, open_id)
+    iso_open = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    exec_log(signal_id, "OPEN", iso_open, vwap_open, qty_open, fee_open, fee_asset_open, None, symbol, side, open_id)
 
     exit_side = "SELL" if side == "long" else "BUY"
-    # SL
-    oSL = BINANCE.new_order(
-        symbol=symbol, side=exit_side, type="STOP_MARKET",
-        stopPrice=sl_r, closePosition="true", workingType="MARK_PRICE"
-    )
-    # TP
-    oTP = BINANCE.new_order(
-        symbol=symbol, side=exit_side, type="TAKE_PROFIT_MARKET",
-        stopPrice=tp_r, closePosition="true", workingType="MARK_PRICE"
-    )
+    oSL = BINANCE.new_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
+                            stopPrice=sl_r, closePosition="true", workingType="MARK_PRICE")
+    oTP = BINANCE.new_order(symbol=symbol, side=exit_side, type="TAKE_PROFIT_MARKET",
+                            stopPrice=tp_r, closePosition="true", workingType="MARK_PRICE")
 
-    # Запам'ятати скобу
     BRACKETS[symbol] = {
+        "id": signal_id,
         "side": side,
         "tp_id": int(oTP.get("orderId")),
         "sl_id": int(oSL.get("orderId")),
+        "open_order_id": open_id,
         "ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }
 
@@ -398,7 +454,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     techlog({"level":"info","msg":"binance_orders_placed",
              "symbol":symbol,"qty":qty,"open_side":open_side,"tp":tp_r,"sl":sl_r,
              "tp_id":BRACKETS[symbol]["tp_id"],"sl_id":BRACKETS[symbol]["sl_id"],
-             "price":price,"mode":"oneway"})
+             "open_order_id":open_id,"price":price,"mode":"oneway"})
     return {"qty":qty, "price":price, "tp":tp_r, "sl":sl_r, "open_order":o1}
 
 # ===== Binance init =====
@@ -406,19 +462,10 @@ BINANCE = None
 if BINANCE_ENABLED and UMFutures:
     try:
         if TESTNET:
-            BINANCE = UMFutures(
-                key=API_KEY_TEST,
-                secret=API_SECRET_TEST,
-                base_url="https://testnet.binancefuture.com"
-            )
+            BINANCE = UMFutures(key=API_KEY_TEST, secret=API_SECRET_TEST, base_url="https://testnet.binancefuture.com")
         else:
-            BINANCE = UMFutures(
-                key=API_KEY_MAIN,
-                secret=API_SECRET_MAIN
-            )
-        techlog({"level":"info","msg":"binance_client_ready",
-                 "import_path":_BINANCE_IMPORT_PATH,"testnet":TESTNET})
-        # Пресет режими
+            BINANCE = UMFutures(key=API_KEY_MAIN, secret=API_SECRET_MAIN)
+        techlog({"level":"info","msg":"binance_client_ready","import_path":_BINANCE_IMPORT_PATH,"testnet":TESTNET})
         if PRESET_SYMBOLS:
             ensure_oneway_mode()
             for s in [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()]:
@@ -428,7 +475,6 @@ if BINANCE_ENABLED and UMFutures:
                     techlog({"level":"info","msg":"preset_leverage_ok","symbol":s,"leverage":LEVERAGE})
                 except Exception as e:
                     techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
-        # Запуск монітора «скоб»
         if CANCEL_ORPHANS:
             threading.Thread(target=_bracket_monitor, daemon=True).start()
             techlog({"level":"info","msg":"bracket_monitor_started","poll_sec":BRACKET_POLL_SEC})
@@ -446,7 +492,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.3.1",
+        "version":"2.3.1+exec",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -460,20 +506,14 @@ def healthz():
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }), 200
 
-# ---- Simple config panel (JSON API) ----
-@app.route("/config", methods=["GET", "POST"])
+@app.route("/config", methods=["GET","POST"])
 def config():
     global RISK_MODE, RISK_PCT, LEVERAGE
     if request.method == "GET":
         return jsonify({
-            "risk_mode": RISK_MODE,
-            "risk_pct": RISK_PCT,
-            "leverage": LEVERAGE,
-            "allow_pattern": ALLOW_PATTERN,
-            "trading_enabled": BINANCE_ENABLED,
-            "testnet": TESTNET
+            "risk_mode": RISK_MODE, "risk_pct": RISK_PCT, "leverage": LEVERAGE,
+            "allow_pattern": ALLOW_PATTERN, "trading_enabled": BINANCE_ENABLED, "testnet": TESTNET
         }), 200
-    # POST (захист)
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
         return jsonify({"status":"error","msg":"unauthorized"}), 401
     try:
@@ -503,11 +543,9 @@ def config():
             techlog({"level":"info","msg":"leverage_config_changed","leverage":LEVERAGE})
         except Exception:
             return jsonify({"status":"error","msg":"leverage must be int"}), 400
-    techlog({"level":"info","msg":"config_updated",
-             "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
+    techlog({"level":"info","msg":"config_updated","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
     return jsonify({"status":"ok","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE}), 200
 
-# ---- Manual leverage setter
 @app.route("/leverage", methods=["POST"])
 def set_leverage_now():
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
@@ -518,12 +556,10 @@ def set_leverage_now():
         data = request.get_json(force=True, silent=False)
     except Exception:
         return jsonify({"status":"error","msg":"bad json"}), 400
-
     symbols = data.get("symbols")
     leverage = int(data.get("leverage", LEVERAGE))
     if not symbols or not isinstance(symbols, list):
         return jsonify({"status":"error","msg":"symbols must be list"}), 400
-
     ensure_oneway_mode()
     done, failed = [], []
     for sym in [str(s).upper() for s in symbols]:
@@ -540,7 +576,6 @@ def set_leverage_now():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     print(f"[WEBHOOK_RX] headers={dict(request.headers)}", flush=True)
-
     if not valid_sig(request):
         techlog({"level":"warn","msg":"bad_signature","headers":dict(request.headers)})
         return jsonify({"status":"error","msg":"bad signature"}), 401
@@ -588,7 +623,7 @@ def webhook():
     if BINANCE_ENABLED and BINANCE:
         try:
             symbol = tv_to_binance_symbol(symbol_tv)
-            place_orders_oneway(symbol=symbol, side=side, entry=info["entry"], tp=info["tp"], sl=info["sl"])
+            place_orders_oneway(symbol=symbol, side=side, entry=info["entry"], tp=info["tp"], sl=info["sl"], signal_id=sig_id)
             techlog({"level":"info","msg":"trade_ok","id":sig_id,"symbol":symbol})
         except Exception as e:
             techlog({"level":"error","msg":"trade_failed","id":sig_id,"err":str(e)})
@@ -597,6 +632,5 @@ def webhook():
 
     return jsonify({"status":"ok","msg":"logged","id":sig_id}), 200
 
-# локальний запуск (у Render стартує через Gunicorn)
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
