@@ -30,7 +30,7 @@ app = Flask(__name__)
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
 LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")  # змініть на inside.csv за бажанням
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
-EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")  # <— НОВЕ: файл з виконаннями
+EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")  # <— файл з виконаннями
 SECRET    = os.environ.get("WEBHOOK_SECRET", "")
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
 ENV_MODE  = os.environ.get("ENV", "prod")
@@ -55,6 +55,9 @@ PRESET_SYMBOLS = os.environ.get("PRESET_SYMBOLS", "")              # "1000PEPEUS
 CANCEL_ORPHANS   = os.environ.get("CANCEL_ORPHANS", "true").lower() == "true"
 BRACKET_POLL_SEC = float(os.environ.get("BRACKET_POLL_SEC", "1"))
 
+# --- NEW: interval for candle-close SL checks (e.g., "1m", "5m", "15m") ---
+KLINE_INTERVAL = os.environ.get("KLINE_INTERVAL", "1m")
+
 os.makedirs(LOG_DIR, exist_ok=True)
 CSV_PATH   = os.path.join(LOG_DIR, LOG_FILE)
 TECH_PATH  = os.path.join(LOG_DIR, TECH_LOG)
@@ -62,8 +65,8 @@ EXEC_PATH  = os.path.join(LOG_DIR, EXEC_LOG)
 
 # ===== utils =====
 DEDUP = OrderedDict()
-# symbol -> {...} тепер містить також 'id' (signal_id) та 'open_order_id'
-BRACKETS = {}  # {"BTCUSDT": {"id":sig, "side":"long","tp_id":..., "sl_id":..., "open_order_id":..., "ts":iso}}
+# symbol -> {...} тепер містить також 'id' (signal_id), 'open_order_id', 'sl_virtual'
+BRACKETS = {}  # {"BTCUSDT": {"id":..., "side":"long","tp_id":..., "sl_id":None, "sl_virtual":..., "open_order_id":..., "ts":iso, "kline_interval":"1m"}}
 
 def techlog(entry: dict):
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -101,10 +104,9 @@ def _exec_write_row(row):
         w.writerow(row)
 
 def exec_log(signal_id: str, event: str, iso_time: str, price, qty, commission, commission_asset, realized_pnl, symbol: str, side: str, order_id: int):
-    """Запис у executions.csv (OPEN/CLOSE). Числові поля можуть бути None."""
     _exec_write_row([
         signal_id, event, iso_time,
-        price if price is not None else "", 
+        price if price is not None else "",
         qty if qty is not None else "",
         commission if commission is not None else "",
         commission_asset or "",
@@ -301,11 +303,55 @@ def _get_order_status(symbol: str, order_id: int) -> str:
         od = BINANCE.query_order(symbol=symbol, orderId=order_id)
     return str(od.get("status", "")).upper()
 
+# ===== NEW: helpers for virtual SL-by-close =====
+def _last_closed_kline(symbol: str, interval: str):
+    """Return (open, high, low, close, close_time_ms) for the last CLOSED candle."""
+    try:
+        kl = BINANCE.klines(symbol=symbol.upper(), interval=interval, limit=2)
+        if not kl or len(kl) < 2:
+            return None
+        o,h,l,c,ct = float(kl[-2][1]), float(kl[-2][2]), float(kl[-2][3]), float(kl[-2][4]), int(kl[-2][6])
+        return o,h,l,c,ct
+    except Exception as e:
+        techlog({"level":"warn","msg":"klines_failed","symbol":symbol,"interval":interval,"err":str(e)})
+        return None
+
+def _position_amt(symbol: str) -> float:
+    try:
+        data = BINANCE.position_risk(symbol=symbol)
+    except Exception:
+        data = BINANCE.position_information(symbol=symbol)
+    amt = 0.0
+    for p in data:
+        if p.get("symbol") == symbol:
+            try:
+                amt = float(p.get("positionAmt") or p.get("positionAmt".upper(), 0.0))
+            except Exception:
+                amt = 0.0
+            break
+    return abs(amt)
+
+def _close_position_market(symbol: str, side: str):
+    """Market close reduce-only by current absolute position size."""
+    qty_pos = _position_amt(symbol)
+    if qty_pos <= 0:
+        return None
+    exit_side = "SELL" if side == "long" else "BUY"
+    filt = fetch_symbol_filters(symbol)
+    step = (filt.get("stepSize") or 0.001)
+    qty = q_floor_to_step(qty_pos, step)
+    if qty <= 0:
+        return None
+    try:
+        return BINANCE.new_order(symbol=symbol, side=exit_side, type="MARKET", quantity=qty, reduceOnly="true")
+    except Exception as e:
+        techlog({"level":"error","msg":"market_close_failed","symbol":symbol,"side":side,"err":str(e)})
+        return None
+
 # ===== ЗБІР ТРЕЙДІВ ДЛЯ ОРДЕРА (для OPEN/CLOSE логів) =====
 def _fetch_trades_for_order(symbol: str, order_id: int):
     """Повертає (vwap_price, total_qty, commission_sum, commission_asset, realized_pnl_sum)."""
     try:
-        # У різних збірках назва може відрізнятись; найчастіше: user_trades
         trades = BINANCE.user_trades(symbol=symbol)
     except Exception:
         try:
@@ -313,7 +359,6 @@ def _fetch_trades_for_order(symbol: str, order_id: int):
         except Exception as e:
             techlog({"level":"warn","msg":"user_trades_failed","symbol":symbol,"order_id":order_id,"err":str(e)})
             return None, None, None, "USDT", None
-    # Фільтруємо по orderId
     flist = [t for t in trades if int(t.get("orderId", 0)) == int(order_id)]
     if not flist:
         return None, None, None, "USDT", None
@@ -345,50 +390,51 @@ def _cancel_order_silent(symbol: str, order_id: int, reason: str):
     except Exception as e:
         techlog({"level":"warn","msg":"cancel_order_failed","symbol":symbol,"order_id":order_id,"err":str(e)})
 
-def _position_amt(symbol: str) -> float:
-    try:
-        data = BINANCE.position_risk(symbol=symbol)
-    except Exception:
-        data = BINANCE.position_information(symbol=symbol)
-    amt = 0.0
-    for p in data:
-        if p.get("symbol") == symbol:
-            try:
-                amt = float(p.get("positionAmt") or p.get("positionAmt".upper(), 0.0))
-            except Exception:
-                amt = 0.0
-            break
-    return abs(amt)
-
 def _bracket_monitor():
-    """Фоновий потік: коли TP/SL стає FILLED — логувати CLOSE і прибрати «брата»."""
+    """Фоновий потік: коли TP/SL стає FILLED — логувати CLOSE і прибрати «брата».
+       Для SL використовуємо ВІРТУАЛЬНУ умову «по закриттю свічки»."""
     while True:
         try:
             for symbol, b in list(BRACKETS.items()):
                 sid   = b.get("id")
                 side  = b.get("side")
                 tp_id = b.get("tp_id")
-                sl_id = b.get("sl_id")
+                sl_id = b.get("sl_id")  # тепер None (використовуємо sl_virtual)
+                sl_v  = b.get("sl_virtual")
 
+                # 1) TP біржовий
                 tp_st = _get_order_status(symbol, tp_id) if tp_id else ""
-                sl_st = _get_order_status(symbol, sl_id) if sl_id else ""
-
                 if tp_st == "FILLED":
                     vwap, qty, fee, fee_asset, rpn = _fetch_trades_for_order(symbol, tp_id)
                     iso = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
                     exec_log(sid, "CLOSE", iso, vwap, qty, fee, fee_asset, rpn, symbol, side, tp_id)
-                    _cancel_order_silent(symbol, sl_id, reason="sibling_tp_filled")
+                    _cancel_order_silent(symbol, sl_id, reason="sibling_tp_filled")  # no-op якщо None
                     BRACKETS.pop(symbol, None)
                     continue
 
-                if sl_st == "FILLED":
-                    vwap, qty, fee, fee_asset, rpn = _fetch_trades_for_order(symbol, sl_id)
-                    iso = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-                    exec_log(sid, "CLOSE", iso, vwap, qty, fee, fee_asset, rpn, symbol, side, sl_id)
-                    _cancel_order_silent(symbol, tp_id, reason="sibling_sl_filled")
-                    BRACKETS.pop(symbol, None)
-                    continue
+                # 2) SL — віртуальний: тригеримо тільки якщо ЗАКРИТТЯ свічки перетнуло рівень
+                if sl_v is not None:
+                    interval = b.get("kline_interval", KLINE_INTERVAL)
+                    kl = _last_closed_kline(symbol, interval)
+                    if kl:
+                        _o,_h,_l,_c,_ct = kl
+                        trigger = False
+                        if side == "long" and _c <= float(sl_v):
+                            trigger = True
+                        if side == "short" and _c >= float(sl_v):
+                            trigger = True
+                        if trigger:
+                            oclose = _close_position_market(symbol, side)
+                            if oclose:
+                                oid = int(oclose.get("orderId", 0)) if isinstance(oclose, dict) else 0
+                                vwap, qty, fee, fee_asset, rpn = _fetch_trades_for_order(symbol, oid)
+                                iso = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+                                exec_log(sid, "CLOSE", iso, vwap, qty, fee, fee_asset, rpn, symbol, side, oid)
+                            _cancel_order_silent(symbol, tp_id, reason="virtual_sl_triggered")
+                            BRACKETS.pop(symbol, None)
+                            continue
 
+                # 3) Безпека: якщо позиції вже немає — прибираємо все
                 if _position_amt(symbol) == 0.0:
                     try:
                         BINANCE.cancel_all_open_orders(symbol=symbol)
@@ -401,7 +447,7 @@ def _bracket_monitor():
         time.sleep(BRACKET_POLL_SEC)
 
 def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
-    """Маркет-вхід + два closePosition тригери (STOP/TP) для one-way (логування OPEN/CLOSE)."""
+    """Маркет-вхід + TP як біржовий; SL — віртуальний (по закриттю свічки)."""
     symbol = symbol.upper()
     ensure_oneway_mode()
     ensure_leverage(symbol)
@@ -424,9 +470,8 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     o1 = BINANCE.new_order(symbol=symbol, side=open_side, type="MARKET", quantity=qty)
     open_id = int(o1.get("orderId"))
 
-    # Почекати коротко і зафіксувати реальні філи (VWAP/fee)
-    # (короткий полінг; не змінює логіку, лише збирає дані)
-    for _ in range(8):  # ~ до ~2-3с загалом
+    # короткий полінг заради логів OPEN
+    for _ in range(8):
         st = _get_order_status(symbol, open_id)
         if st == "FILLED":
             break
@@ -436,26 +481,31 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     exec_log(signal_id, "OPEN", iso_open, vwap_open, qty_open, fee_open, fee_asset_open, None, symbol, side, open_id)
 
     exit_side = "SELL" if side == "long" else "BUY"
-    oSL = BINANCE.new_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
-                            stopPrice=sl_r, closePosition="true", workingType="MARK_PRICE")
-    oTP = BINANCE.new_order(symbol=symbol, side=exit_side, type="TAKE_PROFIT_MARKET",
-                            stopPrice=tp_r, closePosition="true", workingType="MARK_PRICE")
 
+    # TP — реальний біржовий (спрацьовує по wick)
+    oTP = BINANCE.new_order(
+        symbol=symbol, side=exit_side, type="TAKE_PROFIT_MARKET",
+        stopPrice=tp_r, closePosition="true", workingType="MARK_PRICE"
+    )
+
+    # SL — ВІРТУАЛЬНИЙ: слідкуємо у моніторі за закриттям свічки
     BRACKETS[symbol] = {
         "id": signal_id,
         "side": side,
         "tp_id": int(oTP.get("orderId")),
-        "sl_id": int(oSL.get("orderId")),
+        "sl_id": None,                 # біржового SL більше немає
+        "sl_virtual": sl_r,            # рівень SL (tick-aligned)
+        "kline_interval": KLINE_INTERVAL,
         "open_order_id": open_id,
         "ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }
 
-    print(f"[TRADE] {symbol} {side} qty={qty} price={price} tp={tp_r} sl={sl_r}", flush=True)
+    print(f"[TRADE] {symbol} {side} qty={qty} price={price} tp={tp_r} sl_virtual={sl_r}", flush=True)
     techlog({"level":"info","msg":"binance_orders_placed",
-             "symbol":symbol,"qty":qty,"open_side":open_side,"tp":tp_r,"sl":sl_r,
-             "tp_id":BRACKETS[symbol]["tp_id"],"sl_id":BRACKETS[symbol]["sl_id"],
+             "symbol":symbol,"qty":qty,"open_side":open_side,"tp":tp_r,"sl_virtual":sl_r,
+             "tp_id":BRACKETS[symbol]["tp_id"],"sl_id":None,
              "open_order_id":open_id,"price":price,"mode":"oneway"})
-    return {"qty":qty, "price":price, "tp":tp_r, "sl":sl_r, "open_order":o1}
+    return {"qty":qty, "price":price, "tp":tp_r, "sl_virtual":sl_r, "open_order":o1}
 
 # ===== Binance init =====
 BINANCE = None
@@ -492,7 +542,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.3.1+exec",
+        "version":"2.3.1+exec+virtSL",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -503,6 +553,7 @@ def healthz():
         "binance_import_path": _BINANCE_IMPORT_PATH,
         "cancel_orphans": CANCEL_ORPHANS,
         "poll_sec": BRACKET_POLL_SEC,
+        "kline_interval": KLINE_INTERVAL,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }), 200
 
