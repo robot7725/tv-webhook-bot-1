@@ -28,7 +28,7 @@ app = Flask(__name__)
 
 # ===== ENV / config =====
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
-LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")
+LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")  # змініть на inside.csv за бажанням
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
 EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")
 SECRET    = os.environ.get("WEBHOOK_SECRET", "")
@@ -58,7 +58,9 @@ BRACKET_POLL_SEC = float(os.environ.get("BRACKET_POLL_SEC", "1"))
 # Інтервал для перевірки закритих свічок (SL-by-close)
 KLINE_INTERVAL = os.environ.get("KLINE_INTERVAL", "1m")
 
-# Одна позиція: ігнорувати нові входи поки активна позиція (за замовчуванням УВІМКНЕНО)
+# Single-position режим:
+# false  -> нові сигнали ігноруємо, поки позиція не закриється TP/SL
+# true   -> новий сигнал закриває стару позицію + скасовує TP, потім відкриває нову
 REPLACE_ON_NEW = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -73,6 +75,7 @@ BRACKETS = {}  # {"BTCUSDT": {"id":..., "side":"long","tp_id":..., "sl_id":None,
 
 def techlog(entry: dict):
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    os.makedirs(LOG_DIR, exist_ok=True)
     with open(TECH_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     print(f"[TECH] {json.dumps(entry, ensure_ascii=False)}", flush=True)
@@ -171,6 +174,7 @@ def validate_payload(d: dict):
     return True, {"entry":entry, "tp":tp, "sl":sl}
 
 def build_id(pattern: str, side: str, time_raw: str, entry_val: float) -> str:
+    # додаємо entry до id, щоб різні сигнали з однаковим time не вважались дублями
     return f"{pattern}|{side}|{str(time_raw).lower()}|{('{:.10f}'.format(float(entry_val)))}"
 
 def dedup_seen(key: str) -> bool:
@@ -278,6 +282,31 @@ def ensure_leverage(symbol: str):
     except Exception as e:
         techlog({"level":"warn","msg":"change_leverage_failed","symbol":symbol,"err":str(e)})
 
+# ---- універсальний фетч позицій (для сумісності різних SDK) ----
+def _fetch_positions(symbol: str):
+    """Повертає list позицій для symbol, пробуючи різні назви методів у клієнта."""
+    if not BINANCE:
+        return []
+    methods = [
+        "position_risk", "get_position_risk",
+        "position_information", "get_position_information"
+    ]
+    for m in methods:
+        if hasattr(BINANCE, m):
+            try:
+                data = getattr(BINANCE, m)(symbol=symbol)
+                if data is None:
+                    continue
+                # деякі варіанти повертають dict із ключем 'positions'
+                if isinstance(data, dict) and "positions" in data:
+                    return data["positions"]
+                # більшість — список словників
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                continue
+    return []
+
 def compute_qty(symbol: str, price: float) -> float:
     bal = get_available_balance_usdt()
     if RISK_MODE == "margin":
@@ -321,18 +350,19 @@ def _last_closed_kline(symbol: str, interval: str):
 
 def _position_amt(symbol: str) -> float:
     try:
-        data = BINANCE.position_risk(symbol=symbol)
-    except Exception:
-        data = BINANCE.position_information(symbol=symbol)
-    amt = 0.0
-    for p in data:
-        if p.get("symbol") == symbol:
-            try:
-                amt = float(p.get("positionAmt") or p.get("positionAmt".upper(), 0.0))
-            except Exception:
-                amt = 0.0
-            break
-    return abs(amt)
+        data = _fetch_positions(symbol=symbol)
+        amt = 0.0
+        for p in data:
+            if str(p.get("symbol", "")).upper() == symbol.upper():
+                try:
+                    amt = float(p.get("positionAmt") or p.get("positionamt") or 0.0)
+                except Exception:
+                    amt = 0.0
+                break
+        return abs(amt)
+    except Exception as e:
+        techlog({"level":"warn","msg":"position_amt_failed","symbol":symbol,"err":str(e)})
+        return 0.0
 
 def _close_position_market(symbol: str, side: str):
     """Market close reduce-only by current absolute position size."""
@@ -449,10 +479,26 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     ensure_oneway_mode()
     ensure_leverage(symbol)
 
-    # Якщо активний брекет — не відкриваємо новий (у режимі single-position)
-    if symbol in BRACKETS and not REPLACE_ON_NEW:
-        techlog({"level":"info","msg":"skip_new_order_active_bracket","symbol":symbol})
-        return {"skipped": True, "reason": "active_bracket"}
+    # Якщо вже є локальний брекет
+    if symbol in BRACKETS:
+        if not REPLACE_ON_NEW:
+            techlog({"level":"info","msg":"skip_new_order_active_bracket","symbol":symbol})
+            return {"skipped": True, "reason": "active_bracket"}
+        # REPLACE_ON_NEW == true: прибираємо старий TP і закриваємо позицію
+        old = BRACKETS.get(symbol, {})
+        _cancel_order_silent(symbol, old.get("tp_id"), reason="replace_on_new")
+        _close_position_market(symbol, old.get("side", side))
+        BRACKETS.pop(symbol, None)
+        techlog({"level":"info","msg":"replaced_old_bracket","symbol":symbol})
+
+    # Якщо немає брекета, але на біржі є позиція
+    pos_amt = _position_amt(symbol)
+    if pos_amt > 0.0 and REPLACE_ON_NEW:
+        _close_position_market(symbol, side)
+        techlog({"level":"info","msg":"closed_existing_pos_before_new","symbol":symbol,"pos_amt":pos_amt})
+    elif pos_amt > 0.0 and not REPLACE_ON_NEW:
+        techlog({"level":"info","msg":"skip_new_order_existing_pos","symbol":symbol,"pos_amt":pos_amt})
+        return {"skipped": True, "reason": "existing_position"}
 
     price = get_mark_price(symbol)
     qty   = compute_qty(symbol, price)
@@ -539,7 +585,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.3.3+singlePos+virtSL",
+        "version":"2.4.0+singlePos+virtSL+replaceFix",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -549,7 +595,7 @@ def healthz():
         "preset_symbols": [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()],
         "binance_import_path": _BINANCE_IMPORT_PATH,
         "cancel_orphans": CANCEL_ORPHANS,
-        "poll_sec": BRACKET_POLL_SEC,
+        "poll_sec": BRACKETS_POLL_SEC if 'BRACKETS_POLL_SEC' in globals() else BRACKET_POLL_SEC,
         "kline_interval": KLINE_INTERVAL,
         "replace_on_new": REPLACE_ON_NEW,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -650,9 +696,12 @@ def webhook():
 
     print(f"[WEBHOOK_OK] id={sig_id} data={json.dumps(data, ensure_ascii=False)}", flush=True)
 
-    # --- single-position mode: ігноруємо новий сигнал, якщо активна позиція/брекет
+    # single-position логіка в точці входу:
     symbol = tv_to_binance_symbol(symbol_tv)
-    if (symbol in BRACKETS) or (BINANCE_ENABLED and UMFutures and BINANCE and _position_amt(symbol) > 0.0):
+    has_local_bracket = symbol in BRACKETS
+    has_exchange_pos  = (_position_amt(symbol) > 0.0) if (BINANCE_ENABLED and UMFutures and BINANCE) else False
+
+    if (has_local_bracket or has_exchange_pos) and not REPLACE_ON_NEW:
         techlog({"level":"info","msg":"ignored_new_signal_active_position","id":sig_id,"symbol":symbol})
         return jsonify({"status":"ok","msg":"ignored_active_position","id":sig_id}), 200
 
