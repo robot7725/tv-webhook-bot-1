@@ -52,7 +52,7 @@ ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 PRESET_SYMBOLS = os.environ.get("PRESET_SYMBOLS", "")              # "1000PEPEUSDT,BTCUSDT"
 
 # Bracket monitor settings
-CANCEL_ORPHANS   = os.environ.get("CANCEL_ORPHANS", "true").lower() == "true"
+CANCEL_ORPHANS   = os.environ.get("CANCEL_ORPHANS", "true").lower() == "true"  # (тепер не впливає на запуск монітора)
 BRACKET_POLL_SEC = float(os.environ.get("BRACKET_POLL_SEC", "1"))
 
 # Інтервал для перевірки закритих свічок (SL-by-close)
@@ -297,10 +297,8 @@ def _fetch_positions(symbol: str):
                 data = getattr(BINANCE, m)(symbol=symbol)
                 if data is None:
                     continue
-                # деякі варіанти повертають dict із ключем 'positions'
                 if isinstance(data, dict) and "positions" in data:
                     return data["positions"]
-                # більшість — список словників
                 if isinstance(data, list):
                     return data
             except Exception:
@@ -337,13 +335,14 @@ def _get_order_status(symbol: str, order_id: int) -> str:
 
 # ===== SL-by-close helpers =====
 def _last_closed_kline(symbol: str, interval: str):
-    """Return (open, high, low, close, close_time_ms) for the last CLOSED candle."""
+    """Return (open, high, low, close, close_time_ms) for the last CLOSED candle. Log if none."""
     try:
-        kl = BINANCE.klines(symbol=symbol.upper(), interval=interval, limit=2)
+        kl = BINANCE.klines(symbol=symbol.upper(), interval=interval, limit=3)
         if not kl or len(kl) < 2:
+            techlog({"level":"warn","msg":"no_klines","symbol":symbol,"interval":interval,"len":(len(kl) if kl else 0)})
             return None
-        o,h,l,c,ct = float(kl[-2][1]), float(kl[-2][2]), float(kl[-2][3]), float(kl[-2][4]), int(kl[-2][6])
-        return o,h,l,c,ct
+        k = kl[-2]  # остання ЗАКРИТА
+        return float(k[1]), float(k[2]), float(k[3]), float(k[4]), int(k[6])
     except Exception as e:
         techlog({"level":"warn","msg":"klines_failed","symbol":symbol,"interval":interval,"err":str(e)})
         return None
@@ -448,6 +447,7 @@ def _bracket_monitor():
                     kl = _last_closed_kline(symbol, interval)
                     if kl:
                         _o,_h,_l,_c,_ct = kl
+                        techlog({"level":"debug","msg":"sl_check","symbol":symbol,"side":side,"close":_c,"sl_raw":sl_v_raw,"interval":interval})
                         trigger = (side == "long" and _c <= float(sl_v_raw)) or (side == "short" and _c >= float(sl_v_raw))
                         if trigger:
                             oclose = _close_position_market(symbol, side)
@@ -460,6 +460,8 @@ def _bracket_monitor():
                             _cancel_order_silent(symbol, tp_id, reason="virtual_sl_triggered")
                             BRACKETS.pop(symbol, None)
                             continue
+                    else:
+                        techlog({"level":"debug","msg":"sl_skip_no_klines","symbol":symbol,"interval":interval})
 
                 # 3) Якщо позиції вже немає — приберемо все
                 if _position_amt(symbol) == 0.0:
@@ -568,9 +570,9 @@ if BINANCE_ENABLED and UMFutures:
                     techlog({"level":"info","msg":"preset_leverage_ok","symbol":s,"leverage":LEVERAGE})
                 except Exception as e:
                     techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
-        if CANCEL_ORPHANS:
-            threading.Thread(target=_bracket_monitor, daemon=True).start()
-            techlog({"level":"info","msg":"bracket_monitor_started","poll_sec":BRACKET_POLL_SEC,"kline_interval":KLINE_INTERVAL})
+        # Монітор тепер запускаємо ЗАВЖДИ (щоб SL-by-close гарантовано працював)
+        threading.Thread(target=_bracket_monitor, daemon=True).start()
+        techlog({"level":"info","msg":"bracket_monitor_started","poll_sec":BRACKET_POLL_SEC,"kline_interval":KLINE_INTERVAL})
     except Exception as e:
         techlog({"level":"warn","msg":"binance_client_init_failed","err":str(e)})
         BINANCE_ENABLED = False
@@ -585,7 +587,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.4.0+singlePos+virtSL+replaceFix",
+        "version":"2.4.1+monitorAlways+slLogs",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -595,7 +597,7 @@ def healthz():
         "preset_symbols": [x.strip().upper() for x in PRESET_SYMBOLS.split(",") if x.strip()],
         "binance_import_path": _BINANCE_IMPORT_PATH,
         "cancel_orphans": CANCEL_ORPHANS,
-        "poll_sec": BRACKETS_POLL_SEC if 'BRACKETS_POLL_SEC' in globals() else BRACKET_POLL_SEC,
+        "poll_sec": BRACKET_POLL_SEC,
         "kline_interval": KLINE_INTERVAL,
         "replace_on_new": REPLACE_ON_NEW,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
