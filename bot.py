@@ -425,6 +425,26 @@ def _bracket_monitor():
                 sl_v_raw  = b.get("sl_virtual_raw")
                 interval = b.get("kline_interval", KLINE_INTERVAL)
 
+                # --- Жорстке очищення, якщо позиція 0 (навіть після ручного закриття) ---
+                try:
+                    pos_amt_now = _position_amt(symbol)
+                except Exception:
+                    pos_amt_now = 0.0
+                if pos_amt_now == 0.0:
+                    # скасувати все що залишилось на біржі
+                    try:
+                        BINANCE.cancel_all_open_orders(symbol=symbol)
+                        techlog({"level":"info","msg":"cancel_all_on_zero_pos","symbol":symbol})
+                    except Exception as e:
+                        techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":str(e)})
+                    # прибрати локальний брекет
+                    with BR_LOCK:
+                        if symbol in BRACKETS:
+                            BRACKETS.pop(symbol, None)
+                            techlog({"level":"info","msg":"bracket_removed_on_zero_position","symbol":symbol})
+                    # нічого більше робити не треба для цього символу
+                    continue
+
                 # 1) TP біржовий — спрацьовує при торканні MARK_PRICE
                 if tp_id:
                     tp_st = _get_order_status(symbol, tp_id)
@@ -458,15 +478,6 @@ def _bracket_monitor():
                     else:
                         techlog({"level":"debug","msg":"sl_skip_no_klines","symbol":symbol,"interval":interval})
 
-                # 3) Якщо позиції вже немає — приберемо все
-                if _position_amt(symbol) == 0.0:
-                    try:
-                        BINANCE.cancel_all_open_orders(symbol=symbol)
-                        techlog({"level":"info","msg":"cancel_all_on_zero_pos","symbol":symbol})
-                    except Exception as e:
-                        techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":str(e)})
-                    with BR_LOCK:
-                        BRACKETS.pop(symbol, None)
         except Exception as e:
             techlog({"level":"warn","msg":"bracket_monitor_error","err":str(e)})
         time.sleep(BRACKET_POLL_SEC)
@@ -661,7 +672,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.5.0+seedBracket+tpTry+recover+locks",
+        "version":"2.6.0+bracketCleanup+stalePurge",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -774,8 +785,22 @@ def webhook():
 
     # single-position логіка в точці входу:
     symbol = tv_to_binance_symbol(symbol_tv)
+
+    # --- ПЕРЕД перевіркою активності: приберемо застарілий локальний брекет, якщо позиція вже нульова ---
     with BR_LOCK:
         has_local_bracket = symbol in BRACKETS
+    if BINANCE_ENABLED and UMFutures and BINANCE and has_local_bracket:
+        try:
+            if _position_amt(symbol) == 0.0:
+                oo = _list_open_orders(symbol) or []
+                if not oo:
+                    with BR_LOCK:
+                        BRACKETS.pop(symbol, None)
+                    techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":sig_id})
+                    has_local_bracket = False
+        except Exception as e:
+            techlog({"level":"warn","msg":"stale_purge_check_failed","symbol":symbol,"err":str(e)})
+
     has_exchange_pos  = (_position_amt(symbol) > 0.0) if (BINANCE_ENABLED and UMFutures and BINANCE) else False
 
     if (has_local_bracket or has_exchange_pos) and not REPLACE_ON_NEW:
