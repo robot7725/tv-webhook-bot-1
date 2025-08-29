@@ -1,6 +1,8 @@
+# bot.py — v2.7.0 ws-kline-monitor
+
 import os, csv, hmac, hashlib, json, threading, time, re
 from decimal import Decimal, ROUND_DOWN
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
@@ -8,7 +10,9 @@ from flask import Flask, request, jsonify
 BINANCE_ENABLED = os.environ.get("TRADING_ENABLED", "false").lower() == "true"
 
 UMFutures = None
+UMFuturesWS = None
 _BINANCE_IMPORT_PATH = None
+_WS_IMPORT_PATH = None
 if BINANCE_ENABLED:
     try:
         from binance.um_futures import UMFutures as _UM
@@ -24,18 +28,34 @@ if BINANCE_ENABLED:
             BINANCE_ENABLED = False
             UMFutures = None
 
+    # Websocket client (several SDK layouts supported)
+    try:
+        from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient as _WS
+        UMFuturesWS = _WS
+        _WS_IMPORT_PATH = "binance.websocket.um_futures.UMFuturesWebsocketClient"
+    except Exception as ews1:
+        try:
+            # older name
+            from binance.websocket.um_futures import UMFuturesWebsocketClient as _WS
+            UMFuturesWS = _WS
+            _WS_IMPORT_PATH = "binance.websocket.um_futures"
+        except Exception as ews2:
+            UMFuturesWS = None
+            _WS_IMPORT_PATH = None
+            print("[WARN] UMFuturesWebsocketClient not available:", repr(ews1), "|", repr(ews2), flush=True)
+
 app = Flask(__name__)
 
 # ===== ENV / config =====
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
-LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")   # або inside.csv
+LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
 EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")
 SECRET    = os.environ.get("WEBHOOK_SECRET", "")
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
 ENV_MODE  = os.environ.get("ENV", "prod")
 MAX_KEYS  = int(os.environ.get("DEDUP_CACHE", "2000"))
-ROTATE_BYTES = int(os.environ.get("ROTATE_BYTES", str(5*1024*1024)))  # 5MB
+ROTATE_BYTES = int(os.environ.get("ROTATE_BYTES", str(5*1024*1024)))
 KEEP_FILES   = int(os.environ.get("KEEP_FILES", "3"))
 
 # Binance trade settings
@@ -46,8 +66,8 @@ API_KEY_TEST    = os.environ.get("BINANCE_API_KEY_TEST", "")
 API_SECRET_TEST = os.environ.get("BINANCE_API_SECRET_TEST", "")
 
 LEVERAGE     = int(os.environ.get("LEVERAGE", "10"))
-RISK_MODE    = os.environ.get("RISK_MODE", "margin").lower()       # margin | notional
-RISK_PCT     = float(os.environ.get("RISK_PCT", "1.0"))            # % балансу
+RISK_MODE    = os.environ.get("RISK_MODE", "margin").lower()
+RISK_PCT     = float(os.environ.get("RISK_PCT", "1.0"))
 ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","").split(",") if x.strip()]
 
@@ -68,9 +88,15 @@ EXEC_PATH  = os.path.join(LOG_DIR, EXEC_LOG)
 
 # ===== utils =====
 DEDUP = OrderedDict()
-# symbol -> {...} також 'id' (signal_id), 'open_order_id', 'sl_virtual_raw'
+# локальні брекети: symbol -> {...}
 BRACKETS = {}
-BR_LOCK = threading.RLock()
+BR_LOCK  = threading.RLock()
+
+# ws кеш: symbol -> interval -> (o,h,l,c,close_time_ms)
+KLINE_CACHE = defaultdict(dict)
+WS_CLIENT = None
+WS_STARTED = set()
+WS_LOCK = threading.RLock()
 
 def techlog(entry: dict):
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -98,40 +124,36 @@ def rotate_if_needed(path: str):
 def _ensure_exec_header():
     if not os.path.exists(EXEC_PATH) or os.path.getsize(EXEC_PATH) == 0:
         with open(EXEC_PATH, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["signal_id","event","time","price","qty","commission","commission_asset","realized_pnl","symbol","side","order_id"])
+            csv.writer(f).writerow(
+                ["signal_id","event","time","price","qty","commission","commission_asset","realized_pnl","symbol","side","order_id"]
+            )
 
 def _exec_write_row(row):
     rotate_if_needed(EXEC_PATH)
     _ensure_exec_header()
     with open(EXEC_PATH, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(row)
+        csv.writer(f).writerow(row)
 
-def exec_log(signal_id: str, event: str, iso_time: str, price, qty, commission, commission_asset, realized_pnl, symbol: str, side: str, order_id: int):
-    _exec_write_row([
-        signal_id, event, iso_time,
-        price if price is not None else "",
-        qty if qty is not None else "",
-        commission if commission is not None else "",
-        commission_asset or "",
-        realized_pnl if realized_pnl is not None else "",
-        symbol, side, order_id
-    ])
+def exec_log(signal_id, event, iso_time, price, qty, commission, commission_asset, realized_pnl, symbol, side, order_id):
+    _exec_write_row([signal_id, event, iso_time,
+                     price if price is not None else "",
+                     qty if qty is not None else "",
+                     commission if commission is not None else "",
+                     commission_asset or "",
+                     realized_pnl if realized_pnl is not None else "",
+                     symbol, side, order_id])
 
 def to_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
+    try: return float(x)
+    except Exception: return None
 
 def to_iso8601(ts_str: str) -> str:
     s = str(ts_str).strip()
     try:
         v = float(s); iv = int(v)
-        if iv > 10_000_000_000:   # мс
+        if iv > 10_000_000_000:
             return datetime.fromtimestamp(iv/1000, tz=timezone.utc).isoformat().replace("+00:00","Z")
-        if iv > 1_000_000_000:    # сек
+        if iv > 1_000_000_000:
             return datetime.fromtimestamp(iv, tz=timezone.utc).isoformat().replace("+00:00","Z")
     except Exception:
         pass
@@ -142,13 +164,11 @@ def to_iso8601(ts_str: str) -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
 
 def calc_sig(raw_body: bytes) -> str:
-    if not SECRET:
-        return ""
+    if not SECRET: return ""
     return hmac.new(SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
 
 def valid_sig(req) -> bool:
-    if not SECRET:
-        return True
+    if not SECRET: return True
     header = req.headers.get("X-Signature", "")
     try:
         raw = req.get_data(cache=False, as_text=False)
@@ -159,17 +179,12 @@ def valid_sig(req) -> bool:
 def validate_payload(d: dict):
     required = ["signal","symbol","time","side","pattern","entry","tp","sl"]
     miss = [k for k in required if k not in d]
-    if miss:
-        return False, f"Missing fields: {','.join(miss)}"
-    if str(d["signal"]).lower() != "entry":
-        return False, "signal must be 'entry'"
-    if str(d["side"]).lower() not in ("long","short"):
-        return False, "side must be long/short"
-    if str(d["pattern"]).lower() != ALLOW_PATTERN:
-        return False, f"pattern must be '{ALLOW_PATTERN}'"
+    if miss: return False, f"Missing fields: {','.join(miss)}"
+    if str(d["signal"]).lower() != "entry": return False, "signal must be 'entry'"
+    if str(d["side"]).lower() not in ("long","short"): return False, "side must be long/short"
+    if str(d["pattern"]).lower() != ALLOW_PATTERN: return False, f"pattern must be '{ALLOW_PATTERN}'"
     entry = to_float(d["entry"]); tp = to_float(d["tp"]); sl = to_float(d["sl"])
-    if entry is None or tp is None or sl is None:
-        return False, "entry/tp/sl must be numeric"
+    if entry is None or tp is None or sl is None: return False, "entry/tp/sl must be numeric"
     return True, {"entry":entry, "tp":tp, "sl":sl}
 
 def build_id(pattern: str, side: str, time_raw: str, entry_val: float) -> str:
@@ -177,11 +192,9 @@ def build_id(pattern: str, side: str, time_raw: str, entry_val: float) -> str:
 
 def dedup_seen(key: str) -> bool:
     if key in DEDUP:
-        DEDUP.move_to_end(key)
-        return True
+        DEDUP.move_to_end(key); return True
     DEDUP[key] = True
-    if len(DEDUP) > MAX_KEYS:
-        DEDUP.popitem(last=False)
+    if len(DEDUP) > MAX_KEYS: DEDUP.popitem(last=False)
     return False
 
 # ===== heartbeat =====
@@ -189,7 +202,6 @@ def _heartbeat():
     while True:
         print(f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} alive", flush=True)
         time.sleep(60)
-
 threading.Thread(target=_heartbeat, daemon=True).start()
 print("[BOOT] bot process started", flush=True)
 
@@ -213,8 +225,7 @@ def p_floor_to_tick(price: float, tick: float) -> float:
 
 def fetch_symbol_filters(symbol: str):
     symbol = symbol.upper()
-    if symbol in SYMBOL_CACHE:
-        return SYMBOL_CACHE[symbol]
+    if symbol in SYMBOL_CACHE: return SYMBOL_CACHE[symbol]
     info = BINANCE.exchange_info()
     filt = {"stepSize":None, "tickSize":None, "minQty":None, "minNotional":None}
     for s in info.get("symbols", []):
@@ -227,8 +238,7 @@ def fetch_symbol_filters(symbol: str):
                     filt["tickSize"] = float(f["tickSize"])
                 elif t in ("MIN_NOTIONAL","NOTIONAL"):
                     mn = f.get("notional") or f.get("minNotional")
-                    if mn is not None:
-                        filt["minNotional"] = float(mn)
+                    if mn is not None: filt["minNotional"] = float(mn)
             SYMBOL_CACHE[symbol] = filt
             return filt
     raise ValueError(f"Symbol {symbol} not found in exchangeInfo")
@@ -236,8 +246,7 @@ def fetch_symbol_filters(symbol: str):
 def get_available_balance_usdt() -> float:
     bals = BINANCE.balance()
     for b in bals:
-        if b.get("asset") == "USDT":
-            return float(b.get("availableBalance"))
+        if b.get("asset") == "USDT": return float(b.get("availableBalance"))
     raise RuntimeError("USDT balance not found")
 
 def get_mark_price(symbol: str) -> float:
@@ -246,8 +255,7 @@ def get_mark_price(symbol: str) -> float:
 
 def ensure_oneway_mode():
     global ONEWAY_SET
-    if ONEWAY_SET:
-        return
+    if ONEWAY_SET: return
     try:
         try:
             st = BINANCE.get_position_mode()
@@ -271,8 +279,7 @@ def ensure_oneway_mode():
 
 def ensure_leverage(symbol: str):
     symbol = symbol.upper()
-    if symbol in LEVERAGE_SET:
-        return
+    if symbol in LEVERAGE_SET: return
     try:
         BINANCE.change_leverage(symbol=symbol, leverage=LEVERAGE)
         LEVERAGE_SET.add(symbol)
@@ -280,10 +287,8 @@ def ensure_leverage(symbol: str):
     except Exception as e:
         techlog({"level":"warn","msg":"change_leverage_failed","symbol":symbol,"err":str(e)})
 
-# ---- позиції ----
 def _fetch_positions(symbol: str):
-    if not BINANCE:
-        return []
+    if not BINANCE: return []
     methods = ["position_risk","get_position_risk","position_information","get_position_information"]
     for m in methods:
         if hasattr(BINANCE, m):
@@ -299,8 +304,7 @@ def _fetch_positions(symbol: str):
 def compute_qty(symbol: str, price: float) -> float:
     bal = get_available_balance_usdt()
     if RISK_MODE == "margin":
-        margin = bal * (RISK_PCT / 100.0)
-        notional = margin * LEVERAGE
+        margin = bal * (RISK_PCT / 100.0); notional = margin * LEVERAGE
     else:
         notional = bal * (RISK_PCT / 100.0)
     qty_raw = notional / price
@@ -324,30 +328,78 @@ def _get_order_status(symbol: str, order_id: int) -> str:
 def _list_open_orders(symbol: str):
     for m in ("get_open_orders","open_orders"):
         if hasattr(BINANCE, m):
-            try:
-                return getattr(BINANCE, m)(symbol=symbol)
-            except Exception:
-                continue
+            try: return getattr(BINANCE, m)(symbol=symbol)
+            except Exception: continue
     return []
+
+# ===== Websocket kline handling =====
+def _ws_kline_cb(_, msg):
+    """
+    Normalized handler: store LAST CLOSED candle in KLINE_CACHE.
+    """
+    try:
+        d = msg.get("data") if isinstance(msg, dict) and "data" in msg else msg
+        k = d.get("k") if isinstance(d, dict) else None
+        if not k: return
+        if not k.get("x"):  # only closed bars
+            return
+        sym = str(d.get("s") or k.get("s") or "").upper()
+        itv = str(k.get("i"))
+        o = float(k.get("o")); h = float(k.get("h")); l = float(k.get("l")); c = float(k.get("c"))
+        ct = int(k.get("T"))  # close time ms
+        with WS_LOCK:
+            KLINE_CACHE[sym][itv] = (o,h,l,c,ct)
+        techlog({"level":"debug","msg":"ws_kline_closed_bar","symbol":sym,"interval":itv,"close":c})
+    except Exception as e:
+        techlog({"level":"warn","msg":"ws_kline_parse_failed","err":str(e)})
+
+def _start_ws_kline(symbol: str, interval: str):
+    if not UMFuturesWS: 
+        techlog({"level":"warn","msg":"ws_not_available"})
+        return
+    sym = symbol.upper()
+    with WS_LOCK:
+        key = f"{sym}|{interval}"
+        if key in WS_STARTED: 
+            return
+        try:
+            global WS_CLIENT
+            if WS_CLIENT is None:
+                WS_CLIENT = UMFuturesWS()
+            # SDKs differ; support both signatures
+            ok = False
+            try:
+                WS_CLIENT.kline(symbol=sym, interval=interval, callback=_ws_kline_cb)
+                ok = True
+            except Exception:
+                try:
+                    WS_CLIENT.kline(symbol=sym, id=f"{sym}-{interval}", interval=interval, callback=_ws_kline_cb)
+                    ok = True
+                except Exception as e:
+                    techlog({"level":"warn","msg":"ws_kline_subscribe_failed","symbol":sym,"interval":interval,"err":str(e)})
+            if ok:
+                WS_STARTED.add(key)
+                techlog({"level":"info","msg":"ws_kline_started","symbol":sym,"interval":interval,"import_path":_WS_IMPORT_PATH})
+        except Exception as e:
+            techlog({"level":"warn","msg":"ws_client_failed","err":str(e)})
 
 # ===== SL-by-close helpers =====
 def _last_closed_kline(symbol: str, interval: str):
-    """
-    Повертає (open, high, low, close, close_time_ms) для ОСТАННЬОЇ ЗАКРИТОЇ свічки.
-    Binance klines повертає й поточну незакриту. Тому беремо -2, якщо прийшла незакрита.
-    Як fallback — беремо -1, якщо довжина списку == 1.
-    """
+    """First try WS cache; fallback to REST (rare)."""
+    sym = symbol.upper()
+    with WS_LOCK:
+        if interval in KLINE_CACHE.get(sym, {}):
+            return KLINE_CACHE[sym][interval]
+    # REST fallback (rate-limited)
     try:
-        kl = BINANCE.klines(symbol=symbol.upper(), interval=interval, limit=3)
-        if not kl:
-            techlog({"level":"warn","msg":"no_klines","symbol":symbol,"interval":interval,"len":0})
+        kl = BINANCE.klines(symbol=sym, interval=interval, limit=3)
+        if not kl or len(kl) < 2:
+            techlog({"level":"warn","msg":"no_klines_rest","symbol":sym,"interval":interval,"len":(len(kl) if kl else 0)})
             return None
-        # Якщо є хоча б дві — остання ([-1]) може бути поточна. Беремо [-2].
-        idx = -2 if len(kl) >= 2 else -1
-        k = kl[idx]
+        k = kl[-2]
         return float(k[1]), float(k[2]), float(k[3]), float(k[4]), int(k[6])
     except Exception as e:
-        techlog({"level":"warn","msg":"klines_failed","symbol":symbol,"interval":interval,"err":str(e)})
+        techlog({"level":"warn","msg":"klines_rest_failed","symbol":sym,"interval":interval,"err":str(e)})
         return None
 
 def _position_amt(symbol: str) -> float:
@@ -378,7 +430,6 @@ def _close_position_market(symbol: str, side: str):
         techlog({"level":"error","msg":"market_close_failed","symbol":symbol,"side":side,"err":str(e)})
         return None
 
-# ===== трейді по ордеру =====
 def _fetch_trades_for_order(symbol: str, order_id: int):
     try:
         trades = BINANCE.user_trades(symbol=symbol)
@@ -413,7 +464,7 @@ def _cancel_order_silent(symbol: str, order_id: int, reason: str):
 
 # ===== монітор =====
 def _bracket_monitor():
-    """Фоновий потік: TP/SL статус; SL — віртуальний (по закриттю свічки)."""
+    """Background: watch TP status; SL via closed-bar from WS cache."""
     while True:
         try:
             with BR_LOCK:
@@ -425,7 +476,10 @@ def _bracket_monitor():
                 sl_v_raw  = b.get("sl_virtual_raw")
                 interval = b.get("kline_interval", KLINE_INTERVAL)
 
-                # --- якщо позиція нульова — чистимо все і йдемо далі
+                # guarantee ws stream running
+                _start_ws_kline(symbol, interval)
+
+                # cleanup if position = 0
                 try:
                     pos_amt_now = _position_amt(symbol)
                 except Exception:
@@ -442,7 +496,7 @@ def _bracket_monitor():
                             techlog({"level":"info","msg":"bracket_removed_on_zero_position","symbol":symbol})
                     continue
 
-                # 1) TP біржовий
+                # 1) TP — біржовий
                 if tp_id:
                     tp_st = _get_order_status(symbol, tp_id)
                     if tp_st == "FILLED":
@@ -458,8 +512,7 @@ def _bracket_monitor():
                     kl = _last_closed_kline(symbol, interval)
                     if kl:
                         _o,_h,_l,_c,_ct = kl
-                        # <-- змінено на info, щоб було видно в Render -->
-                        techlog({"level":"info","msg":"sl_check","symbol":symbol,"side":side,"close":_c,"sl_raw":sl_v_raw,"interval":interval})
+                        techlog({"level":"debug","msg":"sl_check","symbol":symbol,"side":side,"close":_c,"sl_raw":sl_v_raw,"interval":interval})
                         trigger = (side == "long" and _c <= float(sl_v_raw)) or (side == "short" and _c >= float(sl_v_raw))
                         if trigger:
                             oclose = _close_position_market(symbol, side)
@@ -474,7 +527,7 @@ def _bracket_monitor():
                                 BRACKETS.pop(symbol, None)
                             continue
                     else:
-                        techlog({"level":"info","msg":"sl_skip_no_klines","symbol":symbol,"interval":interval})
+                        techlog({"level":"debug","msg":"sl_skip_no_kline_cache","symbol":symbol,"interval":interval})
 
         except Exception as e:
             techlog({"level":"warn","msg":"bracket_monitor_error","err":str(e)})
@@ -500,10 +553,8 @@ def _load_last_sl_from_csv(symbol_binance: str):
             for row in r:
                 sym = (row.get("symbol") or "").upper()
                 if sym in (tv1, tv2):
-                    try:
-                        last_sl = float(row.get("sl"))
-                    except Exception:
-                        pass
+                    try: last_sl = float(row.get("sl"))
+                    except Exception: pass
         return last_sl
     except Exception as e:
         techlog({"level":"warn","msg":"load_csv_sl_failed","err":str(e)})
@@ -519,8 +570,7 @@ def _recover_state():
                 orders = _list_open_orders(s) or []
                 for od in orders:
                     if str(od.get("type","")).upper() in ("TAKE_PROFIT_MARKET","TAKE_PROFIT") and str(od.get("closePosition","")).lower() in ("true","1","yes"):
-                        tp_id = int(od.get("orderId", 0))
-                        break
+                        tp_id = int(od.get("orderId", 0)); break
                 sl_raw = _load_last_sl_from_csv(s)
                 with BR_LOCK:
                     BRACKETS[s] = {
@@ -533,6 +583,7 @@ def _recover_state():
                         "open_order_id": 0,
                         "ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
                     }
+                _start_ws_kline(s, KLINE_INTERVAL)
                 techlog({"level":"info","msg":"state_recovered","symbol":s,"tp_id":tp_id,"sl_raw":sl_raw})
         except Exception as e:
             techlog({"level":"warn","msg":"state_recover_failed","symbol":s,"err":str(e)})
@@ -568,9 +619,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     price = get_mark_price(symbol)
     qty   = compute_qty(symbol, price)
 
-    filt = fetch_symbol_filters(symbol)
-    tick = filt["tickSize"] or 0.0001
-
+    filt = fetch_symbol_filters(symbol); tick = filt["tickSize"] or 0.0001
     tp_r = p_floor_to_tick(tp, tick)
     sl_raw = float(sl)
 
@@ -581,10 +630,9 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
     for _ in range(8):
         st = _get_order_status(symbol, open_id)
-        if st == "FILLED":
-            break
+        if st == "FILLED": break
         time.sleep(0.3)
-    vwap_open, qty_open, fee_open, fee_asset_open, _rpn_ignored = _fetch_trades_for_order(symbol, open_id)
+    vwap_open, qty_open, fee_open, fee_asset_open, _ = _fetch_trades_for_order(symbol, open_id)
     iso_open = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     exec_log(signal_id, "OPEN", iso_open, vwap_open, qty_open, fee_open, fee_asset_open, None, symbol, side, open_id)
 
@@ -600,8 +648,10 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
             "ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
         }
     techlog({"level":"info","msg":"bracket_seeded","symbol":symbol,"sl_raw":sl_raw})
-
     threading.Thread(target=_after_open_arming_check, args=(symbol,), daemon=True).start()
+
+    # запустити ws-стрім для цього символу (щоб SL працював відразу)
+    _start_ws_kline(symbol, KLINE_INTERVAL)
 
     exit_side = "SELL" if side == "long" else "BUY"
     try:
@@ -644,6 +694,9 @@ if BINANCE_ENABLED and UMFutures:
                     techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
         threading.Thread(target=_bracket_monitor, daemon=True).start()
         techlog({"level":"info","msg":"bracket_monitor_started","poll_sec":BRACKET_POLL_SEC,"kline_interval":KLINE_INTERVAL})
+        # старт WS для пресетів одразу — щоб кеш наповнювався
+        for s in PRESET_SYMBOLS:
+            _start_ws_kline(s, KLINE_INTERVAL)
         _recover_state()
     except Exception as e:
         techlog({"level":"warn","msg":"binance_client_init_failed","err":str(e)})
@@ -659,7 +712,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.6.1+slCheckInfo+closedCandleSafe",
+        "version":"2.7.0+ws_kline_monitor",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -668,6 +721,7 @@ def healthz():
         "leverage": LEVERAGE,
         "preset_symbols": PRESET_SYMBOLS,
         "binance_import_path": _BINANCE_IMPORT_PATH,
+        "ws_import_path": _WS_IMPORT_PATH,
         "cancel_orphans": CANCEL_ORPHANS,
         "poll_sec": BRACKET_POLL_SEC,
         "kline_interval": KLINE_INTERVAL,
@@ -735,8 +789,7 @@ def set_leverage_now():
     for sym in [str(s).upper() for s in symbols]:
         try:
             BINANCE.change_leverage(symbol=sym, leverage=leverage)
-            LEVERAGE_SET.add(sym)
-            done.append(sym)
+            LEVERAGE_SET.add(sym); done.append(sym)
         except Exception as e:
             failed.append({"symbol": sym, "err": str(e)})
     techlog({"level":"info","msg":"manual_leverage_set","done":done,"failed":failed,"leverage":leverage})
@@ -772,7 +825,6 @@ def webhook():
 
     symbol = tv_to_binance_symbol(symbol_tv)
 
-    # Приберемо застарілий локальний брекет, якщо позиція вже нульова
     with BR_LOCK:
         has_local_bracket = symbol in BRACKETS
     if BINANCE_ENABLED and UMFutures and BINANCE and has_local_bracket:
