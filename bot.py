@@ -28,7 +28,7 @@ app = Flask(__name__)
 
 # ===== ENV / config =====
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
-LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")  # можна змінити на inside.csv
+LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")   # або inside.csv
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
 EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")
 SECRET    = os.environ.get("WEBHOOK_SECRET", "")
@@ -49,7 +49,7 @@ LEVERAGE     = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE    = os.environ.get("RISK_MODE", "margin").lower()       # margin | notional
 RISK_PCT     = float(os.environ.get("RISK_PCT", "1.0"))            # % балансу
 ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
-PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","").split(",") if x.strip()]  # напр. "1000PEPEUSDT,BTCUSDT"
+PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","").split(",") if x.strip()]
 
 # Bracket monitor settings
 CANCEL_ORPHANS   = os.environ.get("CANCEL_ORPHANS", "true").lower() == "true"
@@ -58,9 +58,7 @@ BRACKET_POLL_SEC = float(os.environ.get("BRACKET_POLL_SEC", "1"))
 # Інтервал для перевірки закритих свічок (SL-by-close)
 KLINE_INTERVAL = os.environ.get("KLINE_INTERVAL", "1m")
 
-# Single-position режим:
-# false -> нові сигнали ігноруємо, поки позиція не закриється TP/SL
-# true  -> новий сигнал закриває стару позицію + скасовує TP, потім відкриває нову
+# Single-position режим
 REPLACE_ON_NEW = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -72,7 +70,7 @@ EXEC_PATH  = os.path.join(LOG_DIR, EXEC_LOG)
 DEDUP = OrderedDict()
 # symbol -> {...} також 'id' (signal_id), 'open_order_id', 'sl_virtual_raw'
 BRACKETS = {}
-BR_LOCK = threading.RLock()  # потокобезпека для BRACKETS
+BR_LOCK = threading.RLock()
 
 def techlog(entry: dict):
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -175,7 +173,6 @@ def validate_payload(d: dict):
     return True, {"entry":entry, "tp":tp, "sl":sl}
 
 def build_id(pattern: str, side: str, time_raw: str, entry_val: float) -> str:
-    # додаємо entry до id, щоб різні сигнали з однаковим time не вважались дублями
     return f"{pattern}|{side}|{str(time_raw).lower()}|{('{:.10f}'.format(float(entry_val)))}"
 
 def dedup_seen(key: str) -> bool:
@@ -199,7 +196,7 @@ print("[BOOT] bot process started", flush=True)
 # ===== Binance helpers (One-way) =====
 BINANCE = None
 ONEWAY_SET = False
-SYMBOL_CACHE = {}         # symbol -> {stepSize,tickSize,minQty,minNotional}
+SYMBOL_CACHE = {}
 LEVERAGE_SET = set()
 
 def tv_to_binance_symbol(tv_symbol: str) -> str:
@@ -285,7 +282,6 @@ def ensure_leverage(symbol: str):
 
 # ---- позиції ----
 def _fetch_positions(symbol: str):
-    """list позицій для symbol, пробуючи різні назви методів у клієнта."""
     if not BINANCE:
         return []
     methods = ["position_risk","get_position_risk","position_information","get_position_information"]
@@ -336,13 +332,19 @@ def _list_open_orders(symbol: str):
 
 # ===== SL-by-close helpers =====
 def _last_closed_kline(symbol: str, interval: str):
-    """Return (open, high, low, close, close_time_ms) для останньої ЗАКРИТОЇ свічки."""
+    """
+    Повертає (open, high, low, close, close_time_ms) для ОСТАННЬОЇ ЗАКРИТОЇ свічки.
+    Binance klines повертає й поточну незакриту. Тому беремо -2, якщо прийшла незакрита.
+    Як fallback — беремо -1, якщо довжина списку == 1.
+    """
     try:
         kl = BINANCE.klines(symbol=symbol.upper(), interval=interval, limit=3)
-        if not kl or len(kl) < 2:
-            techlog({"level":"warn","msg":"no_klines","symbol":symbol,"interval":interval,"len":(len(kl) if kl else 0)})
+        if not kl:
+            techlog({"level":"warn","msg":"no_klines","symbol":symbol,"interval":interval,"len":0})
             return None
-        k = kl[-2]
+        # Якщо є хоча б дві — остання ([-1]) може бути поточна. Беремо [-2].
+        idx = -2 if len(kl) >= 2 else -1
+        k = kl[idx]
         return float(k[1]), float(k[2]), float(k[3]), float(k[4]), int(k[6])
     except Exception as e:
         techlog({"level":"warn","msg":"klines_failed","symbol":symbol,"interval":interval,"err":str(e)})
@@ -363,7 +365,6 @@ def _position_amt(symbol: str) -> float:
         return 0.0
 
 def _close_position_market(symbol: str, side: str):
-    """Market close reduce-only за поточний обсяг позиції."""
     qty_pos = _position_amt(symbol)
     if qty_pos <= 0: return None
     exit_side = "SELL" if side == "long" else "BUY"
@@ -379,7 +380,6 @@ def _close_position_market(symbol: str, side: str):
 
 # ===== трейді по ордеру =====
 def _fetch_trades_for_order(symbol: str, order_id: int):
-    """Повертає (vwap_price, total_qty, commission_sum, commission_asset, realized_pnl_sum)."""
     try:
         trades = BINANCE.user_trades(symbol=symbol)
     except Exception:
@@ -425,27 +425,24 @@ def _bracket_monitor():
                 sl_v_raw  = b.get("sl_virtual_raw")
                 interval = b.get("kline_interval", KLINE_INTERVAL)
 
-                # --- Жорстке очищення, якщо позиція 0 (навіть після ручного закриття) ---
+                # --- якщо позиція нульова — чистимо все і йдемо далі
                 try:
                     pos_amt_now = _position_amt(symbol)
                 except Exception:
                     pos_amt_now = 0.0
                 if pos_amt_now == 0.0:
-                    # скасувати все що залишилось на біржі
                     try:
                         BINANCE.cancel_all_open_orders(symbol=symbol)
                         techlog({"level":"info","msg":"cancel_all_on_zero_pos","symbol":symbol})
                     except Exception as e:
                         techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":str(e)})
-                    # прибрати локальний брекет
                     with BR_LOCK:
                         if symbol in BRACKETS:
                             BRACKETS.pop(symbol, None)
                             techlog({"level":"info","msg":"bracket_removed_on_zero_position","symbol":symbol})
-                    # нічого більше робити не треба для цього символу
                     continue
 
-                # 1) TP біржовий — спрацьовує при торканні MARK_PRICE
+                # 1) TP біржовий
                 if tp_id:
                     tp_st = _get_order_status(symbol, tp_id)
                     if tp_st == "FILLED":
@@ -456,12 +453,13 @@ def _bracket_monitor():
                             BRACKETS.pop(symbol, None)
                         continue
 
-                # 2) SL — віртуальний по закриттю свічки (RAW)
+                # 2) SL — віртуальний по закриттю свічки
                 if sl_v_raw is not None:
                     kl = _last_closed_kline(symbol, interval)
                     if kl:
                         _o,_h,_l,_c,_ct = kl
-                        techlog({"level":"debug","msg":"sl_check","symbol":symbol,"side":side,"close":_c,"sl_raw":sl_v_raw,"interval":interval})
+                        # <-- змінено на info, щоб було видно в Render -->
+                        techlog({"level":"info","msg":"sl_check","symbol":symbol,"side":side,"close":_c,"sl_raw":sl_v_raw,"interval":interval})
                         trigger = (side == "long" and _c <= float(sl_v_raw)) or (side == "short" and _c >= float(sl_v_raw))
                         if trigger:
                             oclose = _close_position_market(symbol, side)
@@ -476,7 +474,7 @@ def _bracket_monitor():
                                 BRACKETS.pop(symbol, None)
                             continue
                     else:
-                        techlog({"level":"debug","msg":"sl_skip_no_klines","symbol":symbol,"interval":interval})
+                        techlog({"level":"info","msg":"sl_skip_no_klines","symbol":symbol,"interval":interval})
 
         except Exception as e:
             techlog({"level":"warn","msg":"bracket_monitor_error","err":str(e)})
@@ -492,7 +490,6 @@ def _after_open_arming_check(symbol: str):
         techlog({"level":"warn","msg":"bracket_missing_after_open","symbol":symbol})
 
 def _load_last_sl_from_csv(symbol_binance: str):
-    """Шукає останній SL для символу у CSV (допускає і TV-варіант *.P)."""
     tv1 = symbol_binance
     tv2 = symbol_binance + ".P"
     if not os.path.exists(CSV_PATH): return None
@@ -513,7 +510,6 @@ def _load_last_sl_from_csv(symbol_binance: str):
         return None
 
 def _recover_state():
-    """Відновити локальні брекети для відкритих позицій (після рестарту)."""
     if not PRESET_SYMBOLS: return
     for s in PRESET_SYMBOLS:
         try:
@@ -542,12 +538,10 @@ def _recover_state():
             techlog({"level":"warn","msg":"state_recover_failed","symbol":s,"err":str(e)})
 
 def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
-    """Маркет-вхід. BRACKETS створюємо ОДРАЗУ. TP ставимо окремо (не блокує SL-монітор)."""
     symbol = symbol.upper()
     ensure_oneway_mode()
     ensure_leverage(symbol)
 
-    # Якщо вже є локальний брекет
     with BR_LOCK:
         has_bracket = symbol in BRACKETS
     if has_bracket:
@@ -563,7 +557,6 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
             BRACKETS.pop(symbol, None)
         techlog({"level":"info","msg":"replaced_old_bracket","symbol":symbol})
 
-    # Якщо немає брекета, але на біржі є позиція
     pos_amt = _position_amt(symbol)
     if pos_amt > 0.0 and REPLACE_ON_NEW:
         _close_position_market(symbol, side)
@@ -578,15 +571,14 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     filt = fetch_symbol_filters(symbol)
     tick = filt["tickSize"] or 0.0001
 
-    tp_r = p_floor_to_tick(tp, tick)   # біржовий треба округляти
-    sl_raw = float(sl)                 # SL зберігаємо RAW
+    tp_r = p_floor_to_tick(tp, tick)
+    sl_raw = float(sl)
 
     open_side = "BUY" if side == "long" else "SELL"
     o1 = BINANCE.new_order(symbol=symbol, side=open_side, type="MARKET", quantity=qty)
     open_id = int(o1.get("orderId"))
     techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
 
-    # Полінг статусу OPEN — лише для логів
     for _ in range(8):
         st = _get_order_status(symbol, open_id)
         if st == "FILLED":
@@ -596,12 +588,11 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     iso_open = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     exec_log(signal_id, "OPEN", iso_open, vwap_open, qty_open, fee_open, fee_asset_open, None, symbol, side, open_id)
 
-    # ==== ВАЖЛИВО: спершу сідаємо BRACKETS (навіть якщо TP зіб'ється) ====
     with BR_LOCK:
         BRACKETS[symbol] = {
             "id": signal_id,
             "side": side,
-            "tp_id": None,                 # оновимо після успішного TP
+            "tp_id": None,
             "sl_id": None,
             "sl_virtual_raw": sl_raw,
             "kline_interval": KLINE_INTERVAL,
@@ -610,10 +601,8 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         }
     techlog({"level":"info","msg":"bracket_seeded","symbol":symbol,"sl_raw":sl_raw})
 
-    # окремий легкий чек через 2с — переконуємось, що брекет «озброєний»
     threading.Thread(target=_after_open_arming_check, args=(symbol,), daemon=True).start()
 
-    # ==== Ставимо TP; якщо не вдасться — SL все одно працює ====
     exit_side = "SELL" if side == "long" else "BUY"
     try:
         oTP = BINANCE.new_order(
@@ -653,10 +642,8 @@ if BINANCE_ENABLED and UMFutures:
                     techlog({"level":"info","msg":"preset_leverage_ok","symbol":s,"leverage":LEVERAGE})
                 except Exception as e:
                     techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
-        # Монітор — ЗАВЖДИ
         threading.Thread(target=_bracket_monitor, daemon=True).start()
         techlog({"level":"info","msg":"bracket_monitor_started","poll_sec":BRACKET_POLL_SEC,"kline_interval":KLINE_INTERVAL})
-        # Відновити стан після рестарту
         _recover_state()
     except Exception as e:
         techlog({"level":"warn","msg":"binance_client_init_failed","err":str(e)})
@@ -672,7 +659,7 @@ def root():
 def healthz():
     return jsonify({
         "status":"ok",
-        "version":"2.6.0+bracketCleanup+stalePurge",
+        "version":"2.6.1+slCheckInfo+closedCandleSafe",
         "env":ENV_MODE,
         "trading_enabled": BINANCE_ENABLED,
         "testnet": TESTNET,
@@ -783,10 +770,9 @@ def webhook():
 
     print(f"[WEBHOOK_OK] id={sig_id} data={json.dumps(data, ensure_ascii=False)}", flush=True)
 
-    # single-position логіка в точці входу:
     symbol = tv_to_binance_symbol(symbol_tv)
 
-    # --- ПЕРЕД перевіркою активності: приберемо застарілий локальний брекет, якщо позиція вже нульова ---
+    # Приберемо застарілий локальний брекет, якщо позиція вже нульова
     with BR_LOCK:
         has_local_bracket = symbol in BRACKETS
     if BINANCE_ENABLED and UMFutures and BINANCE and has_local_bracket:
