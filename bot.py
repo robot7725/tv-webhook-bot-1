@@ -245,7 +245,7 @@ def _heartbeat():
         time.sleep(60)
 threading.Thread(target=_heartbeat, daemon=True).start()
 
-# ====== BRACKET MONITOR (no virtual SL) ======
+# ====== CLEANUP HELPERS ======
 def _cancel_order_silent(symbol, order_id, reason):
     if not order_id: return
     try:
@@ -254,6 +254,21 @@ def _cancel_order_silent(symbol, order_id, reason):
     except Exception as e:
         techlog({"level":"warn","msg":"cancel_order_failed","symbol":symbol,"order_id":order_id,"err":str(e)})
 
+def _cleanup_orphans(symbol: str, reason: str):
+    try:
+        BINANCE.cancel_all_open_orders(symbol=symbol)
+        techlog({"level":"info","msg":"cancel_all_open_orders","symbol":symbol,"reason":reason})
+    except Exception as e:
+        techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":str(e)})
+
+def _delayed_cleanup(symbol: str, reason: str, delay_sec: float = 2.0):
+    def _task():
+        time.sleep(delay_sec)
+        if _position_amt(symbol) == 0.0:
+            _cleanup_orphans(symbol, reason=f"delayed_{reason}")
+    threading.Thread(target=_task, daemon=True).start()
+
+# ====== BRACKET MONITOR (no virtual SL) ======
 def _bracket_monitor():
     while True:
         try:
@@ -265,13 +280,12 @@ def _bracket_monitor():
 
                 # Якщо позиції немає — прибрати локальну пам'ять, скасувати залишки
                 if _position_amt(symbol)==0.0:
-                    try: BINANCE.cancel_all_open_orders(symbol=symbol)
-                    except Exception as e: techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":str(e)})
+                    _cleanup_orphans(symbol, reason="position_is_zero")
                     with BR_LOCK: BRACKETS.pop(symbol, None)
                     techlog({"level":"info","msg":"bracket_removed_on_zero_position","symbol":symbol})
                     continue
 
-                # Перевірка TP/SL статусів
+                # Перевірка TP
                 if tp_id:
                     st=_get_order_status(symbol, tp_id)
                     if st=="FILLED":
@@ -279,8 +293,12 @@ def _bracket_monitor():
                         exec_log(sid,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                                  vwap,qty,fee,asset,rpn,symbol,side,tp_id)
                         _cancel_order_silent(symbol, sl_id, "tp_filled")
+                        _cleanup_orphans(symbol, reason="tp_filled_cleanup")
                         with BR_LOCK: BRACKETS.pop(symbol,None)
+                        _delayed_cleanup(symbol, reason="after_tp")
                         continue
+
+                # Перевірка SL
                 if sl_id:
                     st=_get_order_status(symbol, sl_id)
                     if st=="FILLED":
@@ -288,7 +306,9 @@ def _bracket_monitor():
                         exec_log(sid,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                                  vwap,qty,fee,asset,rpn,symbol,side,sl_id)
                         _cancel_order_silent(symbol, tp_id, "sl_filled")
+                        _cleanup_orphans(symbol, reason="sl_filled_cleanup")
                         with BR_LOCK: BRACKETS.pop(symbol,None)
+                        _delayed_cleanup(symbol, reason="after_sl")
                         continue
         except Exception as e:
             techlog({"level":"warn","msg":"bracket_monitor_error","err":str(e)})
@@ -328,8 +348,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
     pos_amt=_position_amt(symbol)
     if (has_local or pos_amt>0.0) and REPLACE_ON_NEW:
-        try:
-            BINANCE.cancel_all_open_orders(symbol=symbol)
+        try: _cleanup_orphans(symbol, reason="replace_on_new")
         except: pass
         # закриваємо ринком протилежним side
         exit_side="SELL" if side=="long" else "BUY"
@@ -426,7 +445,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"3.0.0-exchangeSL",
+        "status":"ok","version":"3.1.0-exchangeSL+orphanCleanup",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
