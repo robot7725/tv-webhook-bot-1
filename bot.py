@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify
 
 # ====== CONFIG FROM ENV ======
 BINANCE_ENABLED = os.environ.get("TRADING_ENABLED", "false").lower() == "true"
+
 TESTNET  = os.environ.get("TESTNET", "false").lower() == "true"
 API_KEY_MAIN    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET_MAIN = os.environ.get("BINANCE_API_SECRET", "")
@@ -16,11 +17,12 @@ API_SECRET_TEST = os.environ.get("BINANCE_API_SECRET_TEST", "")
 LEVERAGE   = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notional
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
+
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
 REPLACE_ON_NEW = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","").split(",") if x.strip()]
 
-SECRET   = os.environ.get("WEBHOOK_SECRET", "")
+SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
@@ -30,6 +32,12 @@ EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")
 ROTATE_BYTES = int(os.environ.get("ROTATE_BYTES", str(5*1024*1024)))
 KEEP_FILES   = int(os.environ.get("KEEP_FILES", "3"))
 MAX_KEYS     = int(os.environ.get("DEDUP_CACHE", "2000"))
+
+# NEW: контрольні інтервали та прибирання сиріт
+BRACKET_POLL_SEC = float(os.environ.get("BRACKET_POLL_SEC", "2"))
+CANCEL_ORPHANS   = os.environ.get("CANCEL_ORPHANS", "true").lower() == "true"
+ORPHAN_SWEEP_SEC = float(os.environ.get("ORPHAN_SWEEP_SEC", "10"))
+CANCEL_RETRIES   = int(os.environ.get("CANCEL_RETRIES", "3"))
 
 os.makedirs(LOG_DIR, exist_ok=True)
 CSV_PATH  = os.path.join(LOG_DIR, LOG_FILE)
@@ -212,11 +220,23 @@ def _get_order_status(symbol, order_id:int) -> str:
     except: od = BINANCE.query_order(symbol=symbol, orderId=order_id)
     return str(od.get("status","")).upper()
 
-def _list_open_orders(symbol):
+def _list_open_orders(symbol=None):
+    """
+    Повертає відкриті ордери:
+      - якщо бібліотека дозволяє, без symbol → усі,
+      - інакше для конкретного symbol.
+    """
     for m in ("get_open_orders","open_orders"):
         if hasattr(BINANCE, m):
-            try: return getattr(BINANCE,m)(symbol=symbol)
-            except: pass
+            fn = getattr(BINANCE, m)
+            try:
+                if symbol is None:
+                    return fn()
+                else:
+                    return fn(symbol=symbol)
+            except:
+                if symbol is not None:
+                    continue
     return []
 
 def _fetch_trades_for_order(symbol, order_id:int):
@@ -245,30 +265,33 @@ def _heartbeat():
         time.sleep(60)
 threading.Thread(target=_heartbeat, daemon=True).start()
 
-# ====== CLEANUP HELPERS ======
+# ====== CANCEL HELPERS ======
 def _cancel_order_silent(symbol, order_id, reason):
     if not order_id: return
-    try:
-        BINANCE.cancel_order(symbol=symbol, orderId=order_id)
-        techlog({"level":"info","msg":"cancel_order","symbol":symbol,"order_id":order_id,"reason":reason})
-    except Exception as e:
-        techlog({"level":"warn","msg":"cancel_order_failed","symbol":symbol,"order_id":order_id,"err":str(e)})
+    err = None
+    for i in range(max(1, CANCEL_RETRIES)):
+        try:
+            BINANCE.cancel_order(symbol=symbol, orderId=order_id)
+            techlog({"level":"info","msg":"cancel_order","symbol":symbol,"order_id":order_id,"reason":reason,"try":i+1})
+            return
+        except Exception as e:
+            err = str(e)
+            time.sleep(0.3)
+    techlog({"level":"warn","msg":"cancel_order_failed","symbol":symbol,"order_id":order_id,"err":err})
 
-def _cleanup_orphans(symbol: str, reason: str):
-    try:
-        BINANCE.cancel_all_open_orders(symbol=symbol)
-        techlog({"level":"info","msg":"cancel_all_open_orders","symbol":symbol,"reason":reason})
-    except Exception as e:
-        techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":str(e)})
+def _cancel_all_silent(symbol, reason):
+    err = None
+    for i in range(max(1, CANCEL_RETRIES)):
+        try:
+            BINANCE.cancel_all_open_orders(symbol=symbol)
+            techlog({"level":"info","msg":"cancel_all_open_orders","symbol":symbol,"reason":reason,"try":i+1})
+            return
+        except Exception as e:
+            err = str(e)
+            time.sleep(0.3)
+    techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":err,"reason":reason})
 
-def _delayed_cleanup(symbol: str, reason: str, delay_sec: float = 2.0):
-    def _task():
-        time.sleep(delay_sec)
-        if _position_amt(symbol) == 0.0:
-            _cleanup_orphans(symbol, reason=f"delayed_{reason}")
-    threading.Thread(target=_task, daemon=True).start()
-
-# ====== BRACKET MONITOR (no virtual SL) ======
+# ====== BRACKET MONITOR (only exchange TP/SL) ======
 def _bracket_monitor():
     while True:
         try:
@@ -280,12 +303,12 @@ def _bracket_monitor():
 
                 # Якщо позиції немає — прибрати локальну пам'ять, скасувати залишки
                 if _position_amt(symbol)==0.0:
-                    _cleanup_orphans(symbol, reason="position_is_zero")
+                    _cancel_all_silent(symbol, "pos_is_zero")
                     with BR_LOCK: BRACKETS.pop(symbol, None)
                     techlog({"level":"info","msg":"bracket_removed_on_zero_position","symbol":symbol})
                     continue
 
-                # Перевірка TP
+                # Перевірка TP/SL статусів
                 if tp_id:
                     st=_get_order_status(symbol, tp_id)
                     if st=="FILLED":
@@ -293,12 +316,8 @@ def _bracket_monitor():
                         exec_log(sid,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                                  vwap,qty,fee,asset,rpn,symbol,side,tp_id)
                         _cancel_order_silent(symbol, sl_id, "tp_filled")
-                        _cleanup_orphans(symbol, reason="tp_filled_cleanup")
                         with BR_LOCK: BRACKETS.pop(symbol,None)
-                        _delayed_cleanup(symbol, reason="after_tp")
                         continue
-
-                # Перевірка SL
                 if sl_id:
                     st=_get_order_status(symbol, sl_id)
                     if st=="FILLED":
@@ -306,13 +325,90 @@ def _bracket_monitor():
                         exec_log(sid,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                                  vwap,qty,fee,asset,rpn,symbol,side,sl_id)
                         _cancel_order_silent(symbol, tp_id, "sl_filled")
-                        _cleanup_orphans(symbol, reason="sl_filled_cleanup")
                         with BR_LOCK: BRACKETS.pop(symbol,None)
-                        _delayed_cleanup(symbol, reason="after_sl")
                         continue
         except Exception as e:
             techlog({"level":"warn","msg":"bracket_monitor_error","err":str(e)})
-        time.sleep(2.0)
+        time.sleep(max(0.5, BRACKET_POLL_SEC))
+
+# ====== ORPHAN SWEEPER & RECOVERY ======
+def _recover_state():
+    """Відновлюємо BRACKETS для відкритих позицій і чистимо сиріт без позиції."""
+    # список символів, які точно варто перевірити
+    candidates = set([s for s in PRESET_SYMBOLS if s])  # із ENV
+    # + усі символи з відкритими ордерами, якщо SDK дозволяє
+    try:
+        all_open = _list_open_orders(symbol=None) or []
+        for od in all_open:
+            if "symbol" in od:
+                candidates.add(str(od["symbol"]).upper())
+    except:  # у разі невдачі просто працюємо з PRESET_SYMBOLS
+        pass
+
+    for s in sorted(candidates):
+        try:
+            amt = _position_amt(s)
+            orders = _list_open_orders(s) or []
+            # якщо позиції немає, але є closePosition ордери — приберемо
+            if amt == 0.0:
+                has_close = any(str(od.get("closePosition","")).lower() in ("true","1","yes") for od in orders)
+                if has_close and CANCEL_ORPHANS:
+                    _cancel_all_silent(s, "recover_cleanup_orphans")
+                    techlog({"level":"info","msg":"orphans_cleaned","symbol":s})
+                continue
+
+            # якщо позиція є — відновимо локальний BRACKET
+            tp_id = sl_id = None
+            for od in orders:
+                typ = str(od.get("type","")).upper()
+                if str(od.get("closePosition","")).lower() not in ("true","1","yes"):
+                    continue
+                if typ in ("TAKE_PROFIT_MARKET","TAKE_PROFIT"):
+                    tp_id = int(od.get("orderId",0))
+                elif typ in ("STOP_MARKET","STOP"):
+                    sl_id = int(od.get("orderId",0))
+
+            side = "long" if any(float(p.get("positionAmt",0))>0 for p in _fetch_positions(s)) else "short"
+            with BR_LOCK:
+                BRACKETS[s] = {
+                    "id": f"recover|{s}|{int(time.time())}",
+                    "side": side,
+                    "tp_id": tp_id,
+                    "sl_id": sl_id,
+                    "open_order_id": 0,
+                    "ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+                }
+            techlog({"level":"info","msg":"state_recovered","symbol":s,"tp_id":tp_id,"sl_id":sl_id})
+        except Exception as e:
+            techlog({"level":"warn","msg":"state_recover_failed","symbol":s,"err":str(e)})
+
+def _orphan_sweeper():
+    """Періодично чистимо open closePosition ордери, якщо позиції нема (навіть без BRACKETS)."""
+    if not CANCEL_ORPHANS:
+        return
+    while True:
+        try:
+            # пробуємо зібрати весь список ордерів (або проходимо PRESET_SYMBOLS)
+            symbols = set()
+            try:
+                all_open = _list_open_orders(symbol=None) or []
+                for od in all_open:
+                    sy = str(od.get("symbol","")).upper()
+                    if sy: symbols.add(sy)
+            except:
+                symbols.update([s for s in PRESET_SYMBOLS if s])
+
+            for s in sorted(symbols):
+                try:
+                    if _position_amt(s) == 0.0:
+                        # залишились будь-які open orders? приберемо
+                        if _list_open_orders(s):
+                            _cancel_all_silent(s, "orphan_sweeper")
+                except Exception as e:
+                    techlog({"level":"warn","msg":"orphan_sweep_symbol_failed","symbol":s,"err":str(e)})
+        except Exception as e:
+            techlog({"level":"warn","msg":"orphan_sweeper_failed","err":str(e)})
+        time.sleep(max(3.0, ORPHAN_SWEEP_SEC))
 
 # ====== RISK/QTY ======
 def compute_qty(symbol, price):
@@ -335,7 +431,7 @@ def compute_qty(symbol, price):
     if qty<=0: raise RuntimeError("Computed qty <= 0")
     return qty
 
-# ====== ENTRY/BRACKET (only exchange TP/SL) ======
+# ====== ENTRY/BRACKET (exchange TP/SL only) ======
 def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
     symbol=symbol.upper()
     ensure_oneway_mode(); ensure_leverage(symbol)
@@ -348,14 +444,16 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
     pos_amt=_position_amt(symbol)
     if (has_local or pos_amt>0.0) and REPLACE_ON_NEW:
-        try: _cleanup_orphans(symbol, reason="replace_on_new")
+        try: _cancel_all_silent(symbol, "replace_on_new")
         except: pass
         # закриваємо ринком протилежним side
         exit_side="SELL" if side=="long" else "BUY"
         try:
+            filt=fetch_symbol_filters(symbol); step=filt.get("stepSize") or 0.001
             BINANCE.new_order(symbol=symbol, side=exit_side, type="MARKET", reduceOnly="true",
-                              quantity=q_floor_to_step(pos_amt, (fetch_symbol_filters(symbol).get("stepSize") or 0.001)))
-        except: pass
+                              quantity=q_floor_to_step(pos_amt, step))
+        except Exception as e:
+            techlog({"level":"warn","msg":"replace_market_close_failed","symbol":symbol,"err":str(e)})
         with BR_LOCK: BRACKETS.pop(symbol, None)
         techlog({"level":"info","msg":"replaced_old_position","symbol":symbol})
 
@@ -420,7 +518,7 @@ def dedup_seen(key:str)->bool:
     if len(DEDUP)>MAX_KEYS: DEDUP.popitem(last=False)
     return False
 
-# ====== INIT BINANCE & MONITOR ======
+# ====== INIT BINANCE & WORKERS ======
 if BINANCE_ENABLED and UMFutures:
     try:
         if TESTNET:
@@ -432,8 +530,12 @@ if BINANCE_ENABLED and UMFutures:
         for s in PRESET_SYMBOLS:
             try: BINANCE.change_leverage(symbol=s, leverage=LEVERAGE); LEVERAGE_SET.add(s)
             except Exception as e: techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
+
+        # відновити стан + старт воркерів
+        _recover_state()
         threading.Thread(target=_bracket_monitor, daemon=True).start()
-        techlog({"level":"info","msg":"bracket_monitor_started"})
+        threading.Thread(target=_orphan_sweeper, daemon=True).start()
+        techlog({"level":"info","msg":"workers_started","poll_sec":BRACKET_POLL_SEC,"orphan_sec":ORPHAN_SWEEP_SEC})
     except Exception as e:
         techlog({"level":"warn","msg":"binance_client_init_failed","err":str(e)})
         BINANCE_ENABLED=False; BINANCE=None
@@ -445,11 +547,13 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"3.1.0-exchangeSL+orphanCleanup",
+        "status":"ok","version":"3.1.0-exchangeSL+recovery+orphans",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
         "preset_symbols":PRESET_SYMBOLS,"binance_import_path":_BINANCE_IMPORT_PATH,
+        "poll_sec": BRACKET_POLL_SEC, "orphan_sweep_sec": ORPHAN_SWEEP_SEC,
+        "cancel_orphans": CANCEL_ORPHANS, "cancel_retries": CANCEL_RETRIES,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     })
 
