@@ -98,6 +98,8 @@ BR_LOCK = threading.RLock()
 
 # ====== UTIL ======
 def techlog(entry: dict):
+    # РОТАЦІЯ ФАЙЛУ ТЕХЛОГІВ ПЕРЕД ЗАПИСОМ
+    rotate_if_needed(TECH_PATH)
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     with open(TECH_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -178,8 +180,10 @@ def fetch_symbol_filters(symbol: str):
         if s.get("symbol")==symbol:
             for f in s.get("filters",[]):
                 t=f.get("filterType")
-                if t=="LOT_SIZE": filt["stepSize"]=float(f["stepSize"]); filt["minQty"]=float(f["minQty"])
-                elif t=="PRICE_FILTER": filt["tickSize"]=float(f["tickSize"])
+                if t=="LOT_SIZE": filt["stepSize"]=float(f["stepSize"]); filt["minQty"]=float(f["minQty"]) \
+                
+                elif t=="PRICE_FILTER": filt["tickSize"]=float(f["tickSize"]) \
+                
                 elif t in ("MIN_NOTIONAL","NOTIONAL"):
                     mn=f.get("notional") or f.get("minNotional")
                     if mn is not None: filt["minNotional"]=float(mn)
@@ -245,7 +249,7 @@ def _position_amt(symbol)->float:
 def _get_order_status(symbol, order_id:int) -> str:
     try: od = BINANCE.get_order(symbol=symbol, orderId=order_id)
     except: od = BINANCE.query_order(symbol=symbol, orderId=order_id)
-    return str(od.get("status","")).upper()
+    return str(od.get("status",""))).upper()
 
 def _get_order_exec_qty(symbol, order_id:int) -> float:
     try:
@@ -384,9 +388,9 @@ def _recover_state():
 
             tp_id = sl_id = None
             for od in orders:
-                typ = str(od.get("type","")).upper()
-                ro  = str(od.get("reduceOnly","")).lower() in ("true","1","yes")
-                cp  = str(od.get("closePosition","")).lower() in ("true","1","yes")
+                typ = str(od.get("type",""))).upper()
+                ro  = str(od.get("reduceOnly",""))).lower() in ("true","1","yes")
+                cp  = str(od.get("closePosition",""))).lower() in ("true","1","yes")
                 oid = int(od.get("orderId",0))
                 if (typ=="LIMIT" and ro) or typ in ("TAKE_PROFIT","TAKE_PROFIT_MARKET"):
                     tp_id = oid
@@ -416,7 +420,7 @@ def _orphan_sweeper():
             try:
                 all_open = _list_open_orders(symbol=None) or []
                 for od in all_open:
-                    sy = str(od.get("symbol","")).upper()
+                    sy = str(od.get("symbol",""))).upper()
                     if sy: symbols.add(sy)
             except:
                 symbols.update([s for s in PRESET_SYMBOLS if s])
@@ -515,6 +519,7 @@ def _entry_market(symbol, side, qty):
     o_open=BINANCE.new_order(symbol=symbol, side=open_side, type="MARKET", quantity=qty)
     return int(o_open.get("orderId"))
 
+
 def _entry_limit(symbol, side, qty, price, tif="GTC"):
     filt = fetch_symbol_filters(symbol)
     tick = filt.get("tickSize") or 0.0001
@@ -526,8 +531,10 @@ def _entry_limit(symbol, side, qty, price, tif="GTC"):
                           price=price, quantity=qty, timeInForce=tif)
     return int(o.get("orderId"))
 
+
 def _status_is_open(status: str) -> bool:
     return status in ("NEW","PARTIALLY_FILLED","PENDING_NEW")
+
 
 def _within_deviation(entry_ref, side, max_bps):
     bid, ask = get_best_bid_ask(entry_ref["symbol"])
@@ -538,6 +545,7 @@ def _within_deviation(entry_ref, side, max_bps):
     if dev <= max_bps: return True
     techlog({"level":"info","msg":"deviation_exceeded","sym":entry_ref["symbol"],"dev_bps":dev,"max_bps":max_bps})
     return False
+
 
 def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
     """
@@ -563,7 +571,6 @@ def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
                         quantity=remain_qty,
                         timeInForce=tif
                     )
-                    # різні SDK повертають різні поля для нового id
                     new_id = None
                     for k in ("newOrderId", "orderId", "order", "result", "newClientOrderId"):
                         v = resp.get(k) if isinstance(resp, dict) else None
@@ -578,12 +585,12 @@ def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
                         return new_id, True
                 except Exception as e:
                     techlog({"level":"warn","msg":"entry_reprice_atomic_failed","symbol":symbol,"err":str(e)})
-                    break  # підемо у фолбек
-    # фолбек: окремо cancel → new
+                    break
     _cancel_order_silent(symbol, old_order_id, "chase_reprice")
     new_id = _entry_limit(symbol, side, remain_qty, new_price, tif=tif)
     techlog({"level":"info","msg":"entry_repriced","symbol":symbol,"price":new_price,"remain":remain_qty,"id":new_id})
     return new_id, False
+
 
 def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
     """
@@ -623,7 +630,6 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
         except Exception as e:
             techlog({"level":"warn","msg":"entry_reprice_failed","err":str(e)})
 
-    # Вікно закінчилось → фолбек
     remain = max(0.0, qty - (filled_qty or 0.0))
     if remain > 0:
         try: _cancel_order_silent(symbol, order_id, "fallback")
@@ -647,11 +653,11 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
         techlog({"level":"info","msg":"fallback_none","symbol":symbol,"filled":filled_qty,"remain":remain})
         return order_id, filled_qty
 
+
 def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
     symbol=symbol.upper()
     ensure_oneway_mode(); ensure_leverage(symbol)
 
-    # зачистка «мертвої» скоби
     with BR_LOCK: has_local = symbol in BRACKETS
     if BINANCE and has_local and _position_amt(symbol)==0.0 and not _list_open_orders(symbol):
         with BR_LOCK: BRACKETS.pop(symbol,None)
@@ -659,13 +665,11 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
     pos_amt=_position_amt(symbol)
 
-    # IN-POSITION POLICY
     if pos_amt>0.0:
         if IN_POSITION_POLICY=="ignore":
             techlog({"level":"info","msg":"ignored_new_signal_active_position","id":signal_id,"symbol":symbol})
             return {"status":"ok","msg":"ignored_active_position","id":signal_id}
         elif IN_POSITION_POLICY=="replace":
-            # закриваємо поточну позицію reduceOnly і йдемо ставити нову
             try:
                 exit_side="SELL" if side=="long" else "BUY"
                 filt=fetch_symbol_filters(symbol); step=filt.get("stepSize") or 0.001
@@ -676,8 +680,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
                 techlog({"level":"warn","msg":"replace_market_close_failed","symbol":symbol,"err":str(e)})
             with BR_LOCK: BRACKETS.pop(symbol, None)
 
-    # розрахунки
-    price_ref = get_mark_price(symbol)     # для qty та контролю відхилення
+    price_ref = get_mark_price(symbol)
     qty  = compute_qty(symbol, price_ref)
     filt = fetch_symbol_filters(symbol)
     tick = filt.get("tickSize") or 0.0001
@@ -685,19 +688,17 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     tp_r = p_floor_to_tick(float(tp), tick)
     sl_r = p_floor_to_tick(float(sl), tick)
 
-    # ===== Вхід =====
     if ENTRY_MODE == "market":
         open_id = _entry_market(symbol, side, qty)
     elif ENTRY_MODE == "limit":
         px = _offset_price_from_book(symbol, side, tick)
         tif = "GTX" if POST_ONLY else "GTC"
         open_id = _entry_limit(symbol, side, qty, px, tif=tif)
-    else:  # maker_chase
+    else:
         open_id, filled = _entry_maker_chase(symbol, side, qty, tick, signal_id, price_ref)
         if filled <= 0.0 and FALLBACK == "none":
             techlog({"level":"info","msg":"no_entry_filled","symbol":symbol})
             return {"skipped":True,"reason":"no_filled"}
-        # після часткового заповнення оновимо qty до фактично відкритої позиції
         time.sleep(0.2)
         pos_amt_now = _position_amt(symbol)
         if pos_amt_now > 0:
@@ -710,12 +711,10 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         }
     techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
 
-    # Запис OPEN
     vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
     exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
              vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
 
-    # ===== Виходи =====
     tp_id, sl_id = _place_exits(symbol, side, qty, tp_r, sl_r, signal_id)
 
     return {"qty":qty,"price_ref":price_ref,"tp":tp_r,"sl":sl_r,"open_order_id":open_id,"tp_id":tp_id,"sl_id":sl_id}
@@ -810,6 +809,7 @@ def config():
     techlog({"level":"info","msg":"config_updated","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
     return jsonify({"status":"ok","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
 
+
 def validate_payload(d:dict):
     req = ["signal","symbol","time","side","pattern","entry","tp","sl"]
     miss=[k for k in req if k not in d]
@@ -821,7 +821,8 @@ def validate_payload(d:dict):
     if e is None or t is None or s is None: return False, "entry/tp/sl must be numeric"
     return True, {"entry":e,"tp":t,"sl":s}
 
-@app.route("/webhook", methods=["POST"])
+
+@app.route("/webhook", methods=["POST"]) 
 def webhook():
     if not valid_sig(request):
         techlog({"level":"warn","msg":"bad_signature"}); return jsonify({"status":"error","msg":"bad signature"}),401
@@ -844,7 +845,6 @@ def webhook():
         with BR_LOCK: BRACKETS.pop(symbol,None)
         techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":sig_id}); has_local=False
 
-    # IN-POSITION guard
     if (_position_amt(symbol)>0.0) and IN_POSITION_POLICY=="ignore":
         techlog({"level":"info","msg":"ignored_new_signal_active_position","id":sig_id,"symbol":symbol})
         return jsonify({"status":"ok","msg":"ignored_active_position","id":sig_id})
@@ -852,7 +852,6 @@ def webhook():
     if dedup_seen(sig_id):
         techlog({"level":"info","msg":"duplicate_ignored","id":sig_id}); return jsonify({"status":"ok","msg":"ignored","id":sig_id})
 
-    # log to CSV
     rotate_if_needed(CSV_PATH)
     newfile=not os.path.exists(CSV_PATH)
     with open(CSV_PATH,"a",newline="",encoding="utf-8") as f:
@@ -861,7 +860,6 @@ def webhook():
         w.writerow([data["time"], to_iso8601(data["time"]), symbol_tv, pattern, side, info["entry"], info["tp"], info["sl"], sig_id])
     techlog({"level":"info","msg":"logged","id":sig_id,"symbol":symbol_tv,"side":side})
 
-    # trade
     if BINANCE_ENABLED and BINANCE:
         try:
             place_orders_oneway(symbol, side, info["entry"], info["tp"], info["sl"], sig_id)
@@ -872,6 +870,7 @@ def webhook():
         techlog({"level":"info","msg":"trading_disabled","id":sig_id})
 
     return jsonify({"status":"ok","msg":"logged","id":sig_id})
+
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","5000")))
