@@ -19,7 +19,13 @@ RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notion
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
 
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
-REPLACE_ON_NEW = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
+# ⚠️ SEMANTICS CHANGE:
+# REPLACE_ON_NEW тепер означає АТОМАРНИЙ репрайс (cancelReplace) під час maker-chase.
+REPRICE_ATOMIC = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
+
+# Політика поведінки при наявній позиції: ignore | replace
+IN_POSITION_POLICY = os.environ.get("IN_POSITION_POLICY", "ignore").lower()
+
 PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","").split(",") if x.strip()]
 
 SECRET      = os.environ.get("WEBHOOK_SECRET", "")
@@ -39,18 +45,19 @@ CANCEL_ORPHANS   = os.environ.get("CANCEL_ORPHANS", "true").lower() == "true"
 ORPHAN_SWEEP_SEC = float(os.environ.get("ORPHAN_SWEEP_SEC", "10"))
 CANCEL_RETRIES   = int(os.environ.get("CANCEL_RETRIES", "3"))
 
-# ====== НОВЕ: режим входу та налаштування maker-chase ======
+# ====== РЕЖИМ ВХОДУ ======
 ENTRY_MODE = os.environ.get("ENTRY_MODE", "market").lower()          # market | limit | maker_chase
 POST_ONLY  = os.environ.get("POST_ONLY", "true").lower() == "true"   # для LIMIT/CHASE -> timeInForce=GTX
 
-PRICE_OFFSET_TICKS = int(os.environ.get("PRICE_OFFSET_TICKS", "1"))  # офсет від bestBid/bestAsk у тиках
-PRICE_OFFSET_BPS   = float(os.environ.get("PRICE_OFFSET_BPS", "0"))  # або в bps (0.01% = 1 bps). Якщо >0 — має пріоритет
+# офсет ціни для пост-онлі (пріоритет має BPS)
+PRICE_OFFSET_TICKS = int(os.environ.get("PRICE_OFFSET_TICKS", "0"))
+PRICE_OFFSET_BPS   = float(os.environ.get("PRICE_OFFSET_BPS", "0"))
 
+# maker-chase
 CHASE_INTERVAL_MS  = int(os.environ.get("CHASE_INTERVAL_MS", "400"))
 CHASE_STEPS        = int(os.environ.get("CHASE_STEPS", "10"))
 MAX_WAIT_SEC       = float(os.environ.get("MAX_WAIT_SEC", "3"))
-MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))  # якщо ринок утік далі цього — фолбек
-
+MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))  # дозв. відрив до фолбеку
 FALLBACK = os.environ.get("FALLBACK", "market").lower()              # none | market | limit_ioc
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -189,9 +196,6 @@ def get_mark_price(symbol):
     return float(BINANCE.mark_price(symbol=symbol)["markPrice"])
 
 def get_best_bid_ask(symbol):
-    """
-    Використовуємо /ticker/bookTicker: миттєво дає best bid/ask.
-    """
     bt = BINANCE.book_ticker(symbol=symbol)
     bid = float(bt.get("bidPrice"))
     ask = float(bt.get("askPrice"))
@@ -318,7 +322,7 @@ def _cancel_all_silent(symbol, reason):
             time.sleep(0.3)
     techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":err,"reason":reason})
 
-# ====== BRACKET MONITOR (враховує LIMIT-TP та STOP(SL)) ======
+# ====== BRACKET MONITOR ======
 def _bracket_monitor():
     while True:
         try:
@@ -328,14 +332,12 @@ def _bracket_monitor():
                 sid=b.get("id"); side=b.get("side")
                 tp_id=b.get("tp_id"); sl_id=b.get("sl_id")
 
-                # Якщо позиції немає — прибрати локальну пам'ять, скасувати залишки
                 if _position_amt(symbol)==0.0:
                     _cancel_all_silent(symbol, "pos_is_zero")
                     with BR_LOCK: BRACKETS.pop(symbol, None)
                     techlog({"level":"info","msg":"bracket_removed_on_zero_position","symbol":symbol})
                     continue
 
-                # Перевірка TP/SL статусів
                 if tp_id:
                     st=_get_order_status(symbol, tp_id)
                     if st=="FILLED":
@@ -386,10 +388,8 @@ def _recover_state():
                 ro  = str(od.get("reduceOnly","")).lower() in ("true","1","yes")
                 cp  = str(od.get("closePosition","")).lower() in ("true","1","yes")
                 oid = int(od.get("orderId",0))
-                # TP: або наш LIMIT reduceOnly, або TAKE_PROFIT*
                 if (typ=="LIMIT" and ro) or typ in ("TAKE_PROFIT","TAKE_PROFIT_MARKET"):
                     tp_id = oid
-                # SL: STOP/STOP_MARKET з closePosition або reduceOnly
                 if typ in ("STOP","STOP_MARKET") and (cp or ro):
                     sl_id = oid
 
@@ -453,11 +453,10 @@ def compute_qty(symbol, price):
     if qty<=0: raise RuntimeError("Computed qty <= 0")
     return qty
 
-# ====== НОВЕ: обчислення ціни лімітки для входу ======
+# ====== ORDER PRICE/OFFSET ======
 def _offset_price_from_book(symbol, side, tick):
     bid, ask = get_best_bid_ask(symbol)
     if PRICE_OFFSET_BPS > 0:
-        # офсет у відсотках
         if side=="long":
             base = bid
             px = base*(1 - PRICE_OFFSET_BPS/10000.0)
@@ -465,7 +464,6 @@ def _offset_price_from_book(symbol, side, tick):
             base = ask
             px = base*(1 + PRICE_OFFSET_BPS/10000.0)
     else:
-        # офсет у тиках
         off = max(1, PRICE_OFFSET_TICKS)
         if side=="long":
             px = bid - off*tick
@@ -473,26 +471,29 @@ def _offset_price_from_book(symbol, side, tick):
             px = ask + off*tick
     return p_floor_to_tick(px, tick)
 
-# ====== Вихідні ордери (TP = LIMIT reduceOnly, SL = STOP_MARKET) ======
+# ====== EXIT ORDERS ======
 def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
     exit_side = "SELL" if side=="long" else "BUY"
     tp_id = sl_id = None
+    filt = fetch_symbol_filters(symbol)
+    tick = filt.get("tickSize") or 0.0001
+    step = filt.get("stepSize") or 0.001
+    qty = q_floor_to_step(qty, step)
 
-    # TP: LIMIT reduceOnly GTC
+    # TP LIMIT reduceOnly
     try:
         oTP = BINANCE.new_order(symbol=symbol, side=exit_side, type="LIMIT",
-                                price=p_floor_to_tick(tp_price, fetch_symbol_filters(symbol).get("tickSize") or 0.0001),
-                                quantity=q_floor_to_step(qty, fetch_symbol_filters(symbol).get("stepSize") or 0.001),
-                                timeInForce="GTC", reduceOnly="true")
+                                price=p_floor_to_tick(tp_price, tick),
+                                quantity=qty, timeInForce="GTC", reduceOnly="true")
         tp_id = int(oTP.get("orderId"))
         techlog({"level":"info","msg":"tp_limit_reduceOnly_ok","symbol":symbol,"tp":tp_price,"tp_id":tp_id,"qty":qty})
     except Exception as e:
         techlog({"level":"warn","msg":"tp_limit_reduceOnly_failed","symbol":symbol,"tp":tp_price,"err":str(e)})
 
-    # SL: STOP_MARKET reduceOnly MARK_PRICE
+    # SL STOP_MARKET reduceOnly
     try:
         oSL = BINANCE.new_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
-                                stopPrice=p_floor_to_tick(sl_price, fetch_symbol_filters(symbol).get("tickSize") or 0.0001),
+                                stopPrice=p_floor_to_tick(sl_price, tick),
                                 closePosition="true", workingType="MARK_PRICE")
         sl_id = int(oSL.get("orderId"))
         techlog({"level":"info","msg":"sl_stop_market_ok","symbol":symbol,"sl":sl_price,"sl_id":sl_id})
@@ -506,16 +507,20 @@ def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
             "ts":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
         }
     techlog({"level":"info","msg":"bracket_seeded","symbol":symbol})
-
     return tp_id, sl_id
 
-# ====== ENTRY/BRACKET ======
+# ====== ENTRY HELPERS ======
 def _entry_market(symbol, side, qty):
     open_side="BUY" if side=="long" else "SELL"
     o_open=BINANCE.new_order(symbol=symbol, side=open_side, type="MARKET", quantity=qty)
     return int(o_open.get("orderId"))
 
 def _entry_limit(symbol, side, qty, price, tif="GTC"):
+    filt = fetch_symbol_filters(symbol)
+    tick = filt.get("tickSize") or 0.0001
+    step = filt.get("stepSize") or 0.001
+    price = p_floor_to_tick(price, tick)
+    qty   = q_floor_to_step(qty, step)
     open_side="BUY" if side=="long" else "SELL"
     o = BINANCE.new_order(symbol=symbol, side=open_side, type="LIMIT",
                           price=price, quantity=qty, timeInForce=tif)
@@ -525,9 +530,8 @@ def _status_is_open(status: str) -> bool:
     return status in ("NEW","PARTIALLY_FILLED","PENDING_NEW")
 
 def _within_deviation(entry_ref, side, max_bps):
-    # перевіряємо, чи ринок не "втік" занадто далеко від початкової ціни сигналу
     bid, ask = get_best_bid_ask(entry_ref["symbol"])
-    mkt = (ask+bid)/2.0
+    mkt = ask if side=="short" else bid  # ближня до виконання сторона
     ref = entry_ref["ref_price"]
     if ref<=0: return True
     dev = abs(mkt - ref)/ref*10000.0
@@ -535,12 +539,57 @@ def _within_deviation(entry_ref, side, max_bps):
     techlog({"level":"info","msg":"deviation_exceeded","sym":entry_ref["symbol"],"dev_bps":dev,"max_bps":max_bps})
     return False
 
+def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
+    """
+    Спроба атомарного cancelReplace (REPRICE_ATOMIC=true).
+    Якщо немає потрібного методу або помилка — фолбек на cancel+new.
+    Повертає: (new_order_id, used_atomic: bool)
+    """
+    new_price = _offset_price_from_book(symbol, side, tick)
+    open_side = "BUY" if side=="long" else "SELL"
+
+    if REPRICE_ATOMIC:
+        for m in ("cancel_replace", "cancel_replace_order", "cancelReplace"):
+            if hasattr(BINANCE, m):
+                try:
+                    fn = getattr(BINANCE, m)
+                    resp = fn(
+                        symbol=symbol,
+                        cancelReplaceMode="STOP_ON_FAILURE",
+                        cancelOrderId=old_order_id,
+                        side=open_side,
+                        type="LIMIT",
+                        price=p_floor_to_tick(new_price, tick),
+                        quantity=remain_qty,
+                        timeInForce=tif
+                    )
+                    # різні SDK повертають різні поля для нового id
+                    new_id = None
+                    for k in ("newOrderId", "orderId", "order", "result", "newClientOrderId"):
+                        v = resp.get(k) if isinstance(resp, dict) else None
+                        if isinstance(v, dict) and "orderId" in v:
+                            new_id = int(v["orderId"]); break
+                        if isinstance(v, str) and v.isdigit():
+                            new_id = int(v); break
+                        if isinstance(v, int):
+                            new_id = v; break
+                    if new_id:
+                        techlog({"level":"info","msg":"entry_reprice_atomic_ok","symbol":symbol,"price":new_price,"remain":remain_qty,"id":new_id})
+                        return new_id, True
+                except Exception as e:
+                    techlog({"level":"warn","msg":"entry_reprice_atomic_failed","symbol":symbol,"err":str(e)})
+                    break  # підемо у фолбек
+    # фолбек: окремо cancel → new
+    _cancel_order_silent(symbol, old_order_id, "chase_reprice")
+    new_id = _entry_limit(symbol, side, remain_qty, new_price, tif=tif)
+    techlog({"level":"info","msg":"entry_repriced","symbol":symbol,"price":new_price,"remain":remain_qty,"id":new_id})
+    return new_id, False
+
 def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
     """
-    1) Ставимо LIMIT (POST-ONLY=GTX) трохи вигідніше за bestBid/Ask
-    2) До CHASE_STEPS разів репрайсимо кожні CHASE_INTERVAL_MS
-    3) Якщо не заповнилось у вікно MAX_WAIT_SEC або dev > MAX_DEVIATION_BPS → фолбек
-    Повертає (order_id, filled_qty)
+    1) LIMIT (GTX якщо POST_ONLY)
+    2) До CHASE_STEPS разів репрайсимо кожні CHASE_INTERVAL_MS (атомарно якщо можливо)
+    3) Якщо не наповнилося за MAX_WAIT_SEC або dev > MAX_DEVIATION_BPS → фолбек
     """
     tif = "GTX" if POST_ONLY else "GTC"
     price = _offset_price_from_book(symbol, side, tick)
@@ -565,14 +614,12 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
             {"symbol":symbol,"ref_price":ref_price}, side, MAX_DEVIATION_BPS):
             break
 
-        # Репрайсимо: скасовуємо і виставляємо новий по книзі
+        remain = max(0.0, qty - (filled_qty or 0.0))
+        if remain <= 0:
+            return order_id, filled_qty
+
         try:
-            _cancel_order_silent(symbol, order_id, "chase_reprice")
-            new_price = _offset_price_from_book(symbol, side, tick)
-            order_id = _entry_limit(symbol, side, qty - (filled_qty or 0.0), new_price, tif=tif)
-            techlog({"level":"info","msg":"entry_repriced","symbol":symbol,"price":new_price,"remain":qty-(filled_qty or 0.0),"id":order_id})
-            if qty - (filled_qty or 0.0) <= 0:
-                return order_id, filled_qty
+            order_id, _ = _try_cancel_replace(symbol, side, order_id, remain, tif, tick)
         except Exception as e:
             techlog({"level":"warn","msg":"entry_reprice_failed","err":str(e)})
 
@@ -585,7 +632,7 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
     if FALLBACK == "market" and remain > 0:
         fb_id = _entry_market(symbol, side, remain)
         techlog({"level":"info","msg":"fallback_market_done","symbol":symbol,"remain":remain,"id":fb_id})
-        return fb_id, qty  # вважаємо, що весь залишок виконаний маркетом
+        return fb_id, qty
     elif FALLBACK == "limit_ioc" and remain > 0:
         tif = "IOC"
         fb_price = _offset_price_from_book(symbol, side, tick)
@@ -604,29 +651,30 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     symbol=symbol.upper()
     ensure_oneway_mode(); ensure_leverage(symbol)
 
-    # single-position rules
+    # зачистка «мертвої» скоби
     with BR_LOCK: has_local = symbol in BRACKETS
-    if has_local and not REPLACE_ON_NEW:
-        techlog({"level":"info","msg":"skip_new_order_active_bracket","symbol":symbol})
-        return {"skipped":True,"reason":"active_bracket"}
+    if BINANCE and has_local and _position_amt(symbol)==0.0 and not _list_open_orders(symbol):
+        with BR_LOCK: BRACKETS.pop(symbol,None)
+        techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":signal_id}); has_local=False
 
     pos_amt=_position_amt(symbol)
-    if (has_local or pos_amt>0.0) and REPLACE_ON_NEW:
-        try: _cancel_all_silent(symbol, "replace_on_new")
-        except: pass
-        exit_side="SELL" if side=="long" else "BUY"
-        try:
-            filt=fetch_symbol_filters(symbol); step=filt.get("stepSize") or 0.001
-            BINANCE.new_order(symbol=symbol, side=exit_side, type="MARKET", reduceOnly="true",
-                              quantity=q_floor_to_step(pos_amt, step))
-        except Exception as e:
-            techlog({"level":"warn","msg":"replace_market_close_failed","symbol":symbol,"err":str(e)})
-        with BR_LOCK: BRACKETS.pop(symbol, None)
-        techlog({"level":"info","msg":"replaced_old_position","symbol":symbol})
 
-    if pos_amt>0.0 and not REPLACE_ON_NEW:
-        techlog({"level":"info","msg":"skip_new_order_existing_pos","symbol":symbol,"pos_amt":pos_amt})
-        return {"skipped":True,"reason":"existing_position"}
+    # IN-POSITION POLICY
+    if pos_amt>0.0:
+        if IN_POSITION_POLICY=="ignore":
+            techlog({"level":"info","msg":"ignored_new_signal_active_position","id":signal_id,"symbol":symbol})
+            return {"status":"ok","msg":"ignored_active_position","id":signal_id}
+        elif IN_POSITION_POLICY=="replace":
+            # закриваємо поточну позицію reduceOnly і йдемо ставити нову
+            try:
+                exit_side="SELL" if side=="long" else "BUY"
+                filt=fetch_symbol_filters(symbol); step=filt.get("stepSize") or 0.001
+                BINANCE.new_order(symbol=symbol, side=exit_side, type="MARKET", reduceOnly="true",
+                                  quantity=q_floor_to_step(pos_amt, step))
+                techlog({"level":"info","msg":"replaced_old_position","symbol":symbol,"qty":pos_amt})
+            except Exception as e:
+                techlog({"level":"warn","msg":"replace_market_close_failed","symbol":symbol,"err":str(e)})
+            with BR_LOCK: BRACKETS.pop(symbol, None)
 
     # розрахунки
     price_ref = get_mark_price(symbol)     # для qty та контролю відхилення
@@ -637,7 +685,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     tp_r = p_floor_to_tick(float(tp), tick)
     sl_r = p_floor_to_tick(float(sl), tick)
 
-    # ===== Вхід залежно від режиму =====
+    # ===== Вхід =====
     if ENTRY_MODE == "market":
         open_id = _entry_market(symbol, side, qty)
     elif ENTRY_MODE == "limit":
@@ -649,7 +697,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         if filled <= 0.0 and FALLBACK == "none":
             techlog({"level":"info","msg":"no_entry_filled","symbol":symbol})
             return {"skipped":True,"reason":"no_filled"}
-        # якщо частково виконано — qty для виходів беремо з фактично відкритої позиції
+        # після часткового заповнення оновимо qty до фактично відкритої позиції
         time.sleep(0.2)
         pos_amt_now = _position_amt(symbol)
         if pos_amt_now > 0:
@@ -662,12 +710,12 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         }
     techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
 
-    # Запис факту відкриття
+    # Запис OPEN
     vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
     exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
              vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
 
-    # ===== Виходи (TP=LIMIT reduceOnly; SL=STOP_MARKET) =====
+    # ===== Виходи =====
     tp_id, sl_id = _place_exits(symbol, side, qty, tp_r, sl_r, signal_id)
 
     return {"qty":qty,"price_ref":price_ref,"tp":tp_r,"sl":sl_r,"open_order_id":open_id,"tp_id":tp_id,"sl_id":sl_id}
@@ -711,7 +759,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.0.0-limit-entry+maker-chase+limitTP",
+        "status":"ok","version":"4.1.0-maker-chase+atomic-reprice+guard",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
@@ -724,6 +772,8 @@ def healthz():
         "chase_ms": CHASE_INTERVAL_MS, "chase_steps": CHASE_STEPS,
         "max_wait_sec": MAX_WAIT_SEC, "max_dev_bps": MAX_DEVIATION_BPS,
         "fallback": FALLBACK,
+        "reprice_atomic": REPRICE_ATOMIC,
+        "in_position_policy": IN_POSITION_POLICY,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     })
 
@@ -733,7 +783,7 @@ def config():
     if request.method=="GET":
         return jsonify({"risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
                         "allow_pattern":ALLOW_PATTERN,"trading_enabled":BINANCE_ENABLED,"testnet":TESTNET,
-                        "replace_on_new":REPLACE_ON_NEW,
+                        "reprice_atomic":REPRICE_ATOMIC,"in_position_policy":IN_POSITION_POLICY,
                         "entry_mode":ENTRY_MODE,"post_only":POST_ONLY,
                         "offset_ticks":PRICE_OFFSET_TICKS,"offset_bps":PRICE_OFFSET_BPS,
                         "chase_ms":CHASE_INTERVAL_MS,"chase_steps":CHASE_STEPS,
@@ -794,7 +844,8 @@ def webhook():
         with BR_LOCK: BRACKETS.pop(symbol,None)
         techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":sig_id}); has_local=False
 
-    if (has_local or (_position_amt(symbol)>0.0)) and not REPLACE_ON_NEW:
+    # IN-POSITION guard
+    if (_position_amt(symbol)>0.0) and IN_POSITION_POLICY=="ignore":
         techlog({"level":"info","msg":"ignored_new_signal_active_position","id":sig_id,"symbol":symbol})
         return jsonify({"status":"ok","msg":"ignored_active_position","id":sig_id})
 
