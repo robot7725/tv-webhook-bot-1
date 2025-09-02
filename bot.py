@@ -95,16 +95,7 @@ DEDUP = OrderedDict()
 BRACKETS = {}
 BR_LOCK = threading.RLock()
 
-# ====== UTIL ======
-def techlog(entry: dict):
-    # РОТАЦІЯ перед кожним записом техлога
-    rotate_if_needed(TECH_PATH)
-    entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-    with open(TECH_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    # без f-string, аби уникнути конфліктів із дужками всередині JSON
-    print("[TECH] " + json.dumps(entry, ensure_ascii=False), flush=True)
-
+# ====== ROTATION (safe) ======
 def rotate_if_needed(path: str):
     try:
         if not os.path.exists(path) or os.path.getsize(path) < ROTATE_BYTES:
@@ -113,11 +104,29 @@ def rotate_if_needed(path: str):
             src = f"{path}.{i}"
             dst = f"{path}.{i+1}"
             if os.path.exists(src):
-                if i == KEEP_FILES: os.remove(src)
-                else: os.rename(src, dst)
+                if i == KEEP_FILES:
+                    os.remove(src)
+                else:
+                    os.rename(src, dst)
         os.rename(path, f"{path}.1")
     except Exception as e:
-        techlog({"level":"warn","msg":"rotate_failed","err":str(e),"path":path})
+        # ВАЖЛИВО: не викликаємо techlog тут, щоб уникнути рекурсії при збоях ротації TECH_LOG
+        try:
+            print("[TECH] " + json.dumps(
+                {"level":"warn","msg":"rotate_failed","err":str(e),"path":path},
+                ensure_ascii=False
+            ), flush=True)
+        except Exception:
+            pass
+
+# ====== UTIL ======
+def techlog(entry: dict):
+    # РОТАЦІЯ перед кожним записом техлога
+    rotate_if_needed(TECH_PATH)
+    entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    with open(TECH_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print("[TECH] " + json.dumps(entry, ensure_ascii=False), flush=True)
 
 def _ensure_exec_header():
     if not os.path.exists(EXEC_PATH) or os.path.getsize(EXEC_PATH) == 0:
@@ -760,7 +769,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.1.1-maker-chase+atomic-reprice+guard+log-rotation",
+        "status":"ok","version":"4.1.2-maker-chase+atomic-reprice+guard+log-rotation-safe",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
