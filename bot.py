@@ -491,15 +491,20 @@ def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
     step = filt.get("stepSize") or 0.001
     qty = q_floor_to_step(qty, step)
 
-    # TP LIMIT reduceOnly
+    # TP як TAKE_PROFIT_MARKET (тригер по MARK_PRICE, закриваємо всю позицію)
     try:
-        oTP = BINANCE.new_order(symbol=symbol, side=exit_side, type="LIMIT",
-                                price=p_floor_to_tick(tp_price, tick),
-                                quantity=qty, timeInForce="GTC", reduceOnly="true")
+        oTP = BINANCE.new_order(
+            symbol=symbol,
+            side=exit_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=p_floor_to_tick(tp_price, tick),
+            closePosition="true",
+            workingType="MARK_PRICE"
+        )
         tp_id = int(oTP.get("orderId"))
-        techlog({"level":"info","msg":"tp_limit_reduceOnly_ok","symbol":symbol,"tp":tp_price,"tp_id":tp_id,"qty":qty})
+        techlog({"level":"info","msg":"tp_take_profit_market_ok","symbol":symbol,"tp":tp_price,"tp_id":tp_id})
     except Exception as e:
-        techlog({"level":"warn","msg":"tp_limit_reduceOnly_failed","symbol":symbol,"tp":tp_price,"err":str(e)})
+        techlog({"level":"warn","msg":"tp_take_profit_market_failed","symbol":symbol,"tp":tp_price,"err":str(e)})
 
     # SL STOP_MARKET reduceOnly
     try:
@@ -769,7 +774,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.1.2-maker-chase+atomic-reprice+guard+log-rotation-safe",
+        "status":"ok","version":"4.1.3-maker-chase+atomic-reprice+guard+log-rotation-safe+tp-market",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
