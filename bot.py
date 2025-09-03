@@ -18,7 +18,8 @@ LEVERAGE   = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notional
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
 
-ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
+# 🔧 дефолт змінено з "engulfing" на "inside"
+ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "inside").lower()
 # ⚠️ REPRICE_ATOMIC = прапорець атомарного cancelReplace під час chase
 REPRICE_ATOMIC = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 
@@ -31,7 +32,8 @@ SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
-LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")
+# 🔧 дефолт змінено з "engulfing.csv" на "inside.csv"
+LOG_FILE  = os.environ.get("LOG_FILE", "inside.csv")
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
 EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")
 ROTATE_BYTES = int(os.environ.get("ROTATE_BYTES", str(5*1024*1024)))
