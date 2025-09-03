@@ -18,9 +18,9 @@ LEVERAGE   = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notional
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
 
-# 🔧 дефолт змінено з "engulfing" на "inside"
+# дефолт патерну виправлено на "inside"
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "inside").lower()
-# ⚠️ REPRICE_ATOMIC = прапорець атомарного cancelReplace під час chase
+# прапорець атомарного cancelReplace під час chase
 REPRICE_ATOMIC = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 
 # Політика поведінки при наявній позиції: ignore | replace
@@ -32,7 +32,7 @@ SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
-# 🔧 дефолт змінено з "engulfing.csv" на "inside.csv"
+# дефолт лог-файлу виправлено на inside.csv
 LOG_FILE  = os.environ.get("LOG_FILE", "inside.csv")
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
 EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")
@@ -61,7 +61,7 @@ MAX_WAIT_SEC       = float(os.environ.get("MAX_WAIT_SEC", "3"))
 MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))  # дозволений відрив до фолбеку
 FALLBACK = os.environ.get("FALLBACK", "market").lower()               # none | market | limit_ioc
 
-# ====== Звіти (нове) ======
+# ====== Звіти ( будуємо CSV, пошту НЕ шлемо ) ======
 REPORT_DIR = os.environ.get("REPORT_DIR", os.path.join(LOG_DIR, "reports"))
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
@@ -69,14 +69,6 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 CSV_PATH  = os.path.join(LOG_DIR, LOG_FILE)
 TECH_PATH = os.path.join(LOG_DIR, TECH_LOG)
 EXEC_PATH = os.path.join(LOG_DIR, EXEC_LOG)
-
-# SMTP (беремо з ENV, як у Cron-джобі)
-SMTP_HOST  = os.environ.get("SMTP_HOST", "")
-SMTP_PORT  = int(os.environ.get("SMTP_PORT", "465"))
-SMTP_USER  = os.environ.get("SMTP_USER", "")
-SMTP_PASS  = os.environ.get("SMTP_PASS", "")
-EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
-EMAIL_TO   = os.environ.get("EMAIL_TO", "")
 
 # ====== BINANCE CLIENT ======
 UMFutures = None
@@ -494,7 +486,7 @@ def _offset_price_from_book(symbol, side, tick):
 # ====== EXIT ORDERS ======
 def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
     """
-    НОВЕ: TP як TAKE_PROFIT_MARKET (closePosition=true, workingType=MARK_PRICE).
+    TP як TAKE_PROFIT_MARKET (closePosition=true, workingType=MARK_PRICE).
     SL як STOP_MARKET (closePosition=true).
     Обидва ордери закривають всю позицію незалежно від qty.
     """
@@ -720,7 +712,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         }
     techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
 
-    # Запис OPEN
+    # Запис OPEN (увага: при LIMIT/CHASE може бути ще не повністю заповнений)
     vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
     exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
              vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
@@ -742,16 +734,11 @@ def dedup_seen(key:str)->bool:
     if len(DEDUP)>MAX_KEYS: DEDUP.popitem(last=False)
     return False
 
-# ====== REPORT ENDPOINT (нове) ======
+# ====== REPORT ENDPOINT (CSV only, no email) ======
 try:
     import daily_report as DR
 except Exception:
     DR = None
-
-try:
-    from send_mail import send_file as send_mail_file
-except Exception:
-    send_mail_file = None
 
 from zoneinfo import ZoneInfo
 KYIV = ZoneInfo("Europe/Kyiv")
@@ -774,15 +761,8 @@ def report_daily():
         out_path = os.path.join(REPORT_DIR, f"daily_trades_{day}.csv")
         daily.to_csv(out_path, index=False)
 
+        # пошту не шлемо
         sent = False
-        if daily.shape[0] > 0 and send_mail_file and EMAIL_TO:
-            try:
-                from pathlib import Path
-                send_mail_file(Path(out_path), f"Daily CSV — {day}")
-                sent = True
-            except Exception as e:
-                techlog({"level":"warn","msg":"email_failed","err":str(e)})
-
         return jsonify({"status":"ok","rows":int(daily.shape[0]),"file":out_path,"email_sent":sent})
     except Exception as e:
         techlog({"level":"error","msg":"report_daily_failed","err":str(e)})
@@ -816,7 +796,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.2.0-tpTPM+daily-report-endpoint",
+        "status":"ok","version":"4.2.1-no-mail",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
