@@ -61,7 +61,7 @@ MAX_WAIT_SEC       = float(os.environ.get("MAX_WAIT_SEC", "3"))
 MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))  # дозволений відрив до фолбеку
 FALLBACK = os.environ.get("FALLBACK", "market").lower()               # none | market | limit_ioc
 
-# ====== Звіти ( будуємо CSV, пошту НЕ шлемо ) ======
+# ====== Звіти (CSV only, без пошти) ======
 REPORT_DIR = os.environ.get("REPORT_DIR", os.path.join(LOG_DIR, "reports"))
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
@@ -284,6 +284,25 @@ def _list_open_orders(symbol=None):
                     continue
     return []
 
+# ---- NEW: класифікація відкритих ордерів (entry vs exit) ----
+def _split_open_orders(symbol):
+    """
+    Повертає (entry_orders, exit_orders).
+    Exit-ордери: STOP/STOP_MARKET/TAKE_PROFIT/TAKE_PROFIT_MARKET або reduceOnly/closePosition.
+    Entry-ордери: усе інше.
+    """
+    orders = _list_open_orders(symbol) or []
+    entries, exits = [], []
+    for od in orders:
+        typ = str(od.get("type","")).upper()
+        ro  = str(od.get("reduceOnly","")).lower() in ("true","1","yes")
+        cp  = str(od.get("closePosition","")).lower() in ("true","1","yes")
+        if typ in ("STOP","STOP_MARKET","TAKE_PROFIT","TAKE_PROFIT_MARKET") or ro or cp:
+            exits.append(od)
+        else:
+            entries.append(od)
+    return entries, exits
+
 def _fetch_trades_for_order(symbol, order_id:int):
     try: trades = BINANCE.user_trades(symbol=symbol)
     except:
@@ -346,12 +365,30 @@ def _bracket_monitor():
                 sid=b.get("id"); side=b.get("side")
                 tp_id=b.get("tp_id"); sl_id=b.get("sl_id")
 
+                # --- якщо ми плоскі, не зносимо entry-ордера ---
                 if _position_amt(symbol)==0.0:
-                    _cancel_all_silent(symbol, "pos_is_zero")
+                    entries, exits = _split_open_orders(symbol)
+
+                    if entries:
+                        # Є ліміт/чейз на вхід — не чіпаємо нічого.
+                        techlog({"level":"debug","msg":"flat_but_entry_present","symbol":symbol,"entries":len(entries),"exits":len(exits)})
+                        continue
+
+                    if exits:
+                        # Сирітські виходи без позиції та без entry — приберемо тільки їх.
+                        for od in exits:
+                            oid = int(od.get("orderId", 0))
+                            _cancel_order_silent(symbol, oid, "pos_is_zero_exit_cleanup")
+                        with BR_LOCK: BRACKETS.pop(symbol, None)
+                        techlog({"level":"info","msg":"exit_orphans_cleaned_flat","symbol":symbol,"count":len(exits)})
+                        continue
+
+                    # Немає ні entry, ні exit — чистимо локальний стан, якщо зостався.
                     with BR_LOCK: BRACKETS.pop(symbol, None)
-                    techlog({"level":"info","msg":"bracket_removed_on_zero_position","symbol":symbol})
+                    techlog({"level":"info","msg":"bracket_removed_flat_no_orders","symbol":symbol})
                     continue
 
+                # --- позиція є: слідкуємо за TP/SL ---
                 if tp_id:
                     st=_get_order_status(symbol, tp_id)
                     if st=="FILLED":
@@ -389,13 +426,20 @@ def _recover_state():
         try:
             amt = _position_amt(s)
             orders = _list_open_orders(s) or []
+            entries, exits = _split_open_orders(s)
+
             if amt == 0.0:
-                has_any = len(orders)>0
-                if has_any and CANCEL_ORPHANS:
-                    _cancel_all_silent(s, "recover_cleanup_orphans")
-                    techlog({"level":"info","msg":"orphans_cleaned","symbol":s})
+                # Ми плоскі: не чіпаємо pending-entries; прибираємо лише сирітські exits (якщо немає entries).
+                if entries:
+                    techlog({"level":"info","msg":"recover_flat_keep_entries","symbol":s,"entries":len(entries),"exits":len(exits)})
+                    continue
+                if exits and CANCEL_ORPHANS:
+                    for od in exits:
+                        _cancel_order_silent(s, int(od.get("orderId",0)), "recover_cleanup_exit_orphans")
+                    techlog({"level":"info","msg":"recover_exit_orphans_cleaned","symbol":s,"count":len(exits)})
                 continue
 
+            # Позиція є: відновлюємо ідентифікатори TP/SL.
             tp_id = sl_id = None
             for od in orders:
                 typ = str(od.get("type","")).upper()
@@ -438,8 +482,12 @@ def _orphan_sweeper():
             for s in sorted(symbols):
                 try:
                     if _position_amt(s) == 0.0:
-                        if _list_open_orders(s):
-                            _cancel_all_silent(s, "orphan_sweeper")
+                        entries, exits = _split_open_orders(s)
+                        # лишаємо entry-ордера в спокої; прибираємо тільки сирітські виходи за відсутності entries
+                        if (not entries) and exits:
+                            for od in exits:
+                                _cancel_order_silent(s, int(od.get("orderId",0)), "orphan_sweeper_exit_only")
+                            techlog({"level":"info","msg":"orphan_sweeper_exit_cleaned","symbol":s,"count":len(exits)})
                 except Exception as e:
                     techlog({"level":"warn","msg":"orphan_sweep_symbol_failed","symbol":s,"err":str(e)})
         except Exception as e:
@@ -712,7 +760,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         }
     techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
 
-    # Запис OPEN (увага: при LIMIT/CHASE може бути ще не повністю заповнений)
+    # Запис OPEN (при LIMIT/CHASE може бути ще не повністю заповнений)
     vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
     exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
              vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
@@ -734,7 +782,7 @@ def dedup_seen(key:str)->bool:
     if len(DEDUP)>MAX_KEYS: DEDUP.popitem(last=False)
     return False
 
-# ====== REPORT ENDPOINT (CSV only, no email) ======
+# ====== REPORT ENDPOINT (CSV only) ======
 try:
     import daily_report as DR
 except Exception:
@@ -796,7 +844,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.2.1-no-mail",
+        "status":"ok","version":"4.2.2-exit-only-sweep",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
