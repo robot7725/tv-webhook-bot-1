@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, json, csv, hmac, hashlib, threading, time, re, math
+import os, json, csv, hmac, hashlib, threading, time, re
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from collections import OrderedDict
@@ -19,7 +19,7 @@ RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notion
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
 
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
-# ⚠️ Семантика: змінна REPLACE_ON_NEW використовується як прапорець атомарного cancelReplace під час chase
+# ⚠️ REPRICE_ATOMIC = прапорець атомарного cancelReplace під час chase
 REPRICE_ATOMIC = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 
 # Політика поведінки при наявній позиції: ignore | replace
@@ -59,10 +59,22 @@ MAX_WAIT_SEC       = float(os.environ.get("MAX_WAIT_SEC", "3"))
 MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))  # дозволений відрив до фолбеку
 FALLBACK = os.environ.get("FALLBACK", "market").lower()               # none | market | limit_ioc
 
+# ====== Звіти (нове) ======
+REPORT_DIR = os.environ.get("REPORT_DIR", os.path.join(LOG_DIR, "reports"))
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(REPORT_DIR, exist_ok=True)
+
 CSV_PATH  = os.path.join(LOG_DIR, LOG_FILE)
 TECH_PATH = os.path.join(LOG_DIR, TECH_LOG)
 EXEC_PATH = os.path.join(LOG_DIR, EXEC_LOG)
+
+# SMTP (беремо з ENV, як у Cron-джобі)
+SMTP_HOST  = os.environ.get("SMTP_HOST", "")
+SMTP_PORT  = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USER  = os.environ.get("SMTP_USER", "")
+SMTP_PASS  = os.environ.get("SMTP_PASS", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
+EMAIL_TO   = os.environ.get("EMAIL_TO", "")
 
 # ====== BINANCE CLIENT ======
 UMFutures = None
@@ -110,7 +122,6 @@ def rotate_if_needed(path: str):
                     os.rename(src, dst)
         os.rename(path, f"{path}.1")
     except Exception as e:
-        # ВАЖЛИВО: не викликаємо techlog тут, щоб уникнути рекурсії при збоях ротації TECH_LOG
         try:
             print("[TECH] " + json.dumps(
                 {"level":"warn","msg":"rotate_failed","err":str(e),"path":path},
@@ -121,7 +132,6 @@ def rotate_if_needed(path: str):
 
 # ====== UTIL ======
 def techlog(entry: dict):
-    # РОТАЦІЯ перед кожним записом техлога
     rotate_if_needed(TECH_PATH)
     entry["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     with open(TECH_PATH, "a", encoding="utf-8") as f:
@@ -208,8 +218,7 @@ def get_mark_price(symbol):
 
 def get_best_bid_ask(symbol):
     bt = BINANCE.book_ticker(symbol=symbol)
-    bid = float(bt.get("bidPrice"))
-    ask = float(bt.get("askPrice"))
+    bid = float(bt.get("bidPrice")); ask = float(bt.get("askPrice"))
     return bid, ask
 
 def ensure_oneway_mode():
@@ -469,11 +478,9 @@ def _offset_price_from_book(symbol, side, tick):
     bid, ask = get_best_bid_ask(symbol)
     if PRICE_OFFSET_BPS > 0:
         if side=="long":
-            base = bid
-            px = base*(1 - PRICE_OFFSET_BPS/10000.0)
+            base = bid; px = base*(1 - PRICE_OFFSET_BPS/10000.0)
         else:
-            base = ask
-            px = base*(1 + PRICE_OFFSET_BPS/10000.0)
+            base = ask; px = base*(1 + PRICE_OFFSET_BPS/10000.0)
     else:
         off = max(1, PRICE_OFFSET_TICKS)
         if side=="long":
@@ -484,33 +491,35 @@ def _offset_price_from_book(symbol, side, tick):
 
 # ====== EXIT ORDERS ======
 def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
+    """
+    НОВЕ: TP як TAKE_PROFIT_MARKET (closePosition=true, workingType=MARK_PRICE).
+    SL як STOP_MARKET (closePosition=true).
+    Обидва ордери закривають всю позицію незалежно від qty.
+    """
     exit_side = "SELL" if side=="long" else "BUY"
     tp_id = sl_id = None
     filt = fetch_symbol_filters(symbol)
     tick = filt.get("tickSize") or 0.0001
-    step = filt.get("stepSize") or 0.001
-    qty = q_floor_to_step(qty, step)
 
-    # TP як TAKE_PROFIT_MARKET (тригер по MARK_PRICE, закриваємо всю позицію)
+    # TP: TAKE_PROFIT_MARKET (closePosition)
     try:
         oTP = BINANCE.new_order(
-            symbol=symbol,
-            side=exit_side,
-            type="TAKE_PROFIT_MARKET",
+            symbol=symbol, side=exit_side, type="TAKE_PROFIT_MARKET",
             stopPrice=p_floor_to_tick(tp_price, tick),
-            closePosition="true",
-            workingType="MARK_PRICE"
+            closePosition="true", workingType="MARK_PRICE"
         )
         tp_id = int(oTP.get("orderId"))
         techlog({"level":"info","msg":"tp_take_profit_market_ok","symbol":symbol,"tp":tp_price,"tp_id":tp_id})
     except Exception as e:
         techlog({"level":"warn","msg":"tp_take_profit_market_failed","symbol":symbol,"tp":tp_price,"err":str(e)})
 
-    # SL STOP_MARKET reduceOnly
+    # SL: STOP_MARKET (closePosition)
     try:
-        oSL = BINANCE.new_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
-                                stopPrice=p_floor_to_tick(sl_price, tick),
-                                closePosition="true", workingType="MARK_PRICE")
+        oSL = BINANCE.new_order(
+            symbol=symbol, side=exit_side, type="STOP_MARKET",
+            stopPrice=p_floor_to_tick(sl_price, tick),
+            closePosition="true", workingType="MARK_PRICE"
+        )
         sl_id = int(oSL.get("orderId"))
         techlog({"level":"info","msg":"sl_stop_market_ok","symbol":symbol,"sl":sl_price,"sl_id":sl_id})
     except Exception as e:
@@ -547,7 +556,7 @@ def _status_is_open(status: str) -> bool:
 
 def _within_deviation(entry_ref, side, max_bps):
     bid, ask = get_best_bid_ask(entry_ref["symbol"])
-    mkt = ask if side=="short" else bid  # ближня до виконання сторона
+    mkt = ask if side=="short" else bid
     ref = entry_ref["ref_price"]
     if ref<=0: return True
     dev = abs(mkt - ref)/ref*10000.0
@@ -556,11 +565,6 @@ def _within_deviation(entry_ref, side, max_bps):
     return False
 
 def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
-    """
-    Спроба атомарного cancelReplace (REPRICE_ATOMIC=true).
-    Якщо немає потрібного методу або помилка — фолбек на cancel+new.
-    Повертає: (new_order_id, used_atomic: bool)
-    """
     new_price = _offset_price_from_book(symbol, side, tick)
     open_side = "BUY" if side=="long" else "SELL"
 
@@ -594,19 +598,13 @@ def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
                         return new_id, True
                 except Exception as e:
                     techlog({"level":"warn","msg":"entry_reprice_atomic_failed","symbol":symbol,"err":str(e)})
-                    break  # підемо у фолбек
-    # фолбек: окремо cancel → new
+                    break
     _cancel_order_silent(symbol, old_order_id, "chase_reprice")
     new_id = _entry_limit(symbol, side, remain_qty, new_price, tif=tif)
     techlog({"level":"info","msg":"entry_repriced","symbol":symbol,"price":new_price,"remain":remain_qty,"id":new_id})
     return new_id, False
 
 def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
-    """
-    1) LIMIT (GTX якщо POST_ONLY)
-    2) До CHASE_STEPS разів репрайсимо кожні CHASE_INTERVAL_MS (атомарно якщо можливо)
-    3) Якщо не наповнилося за MAX_WAIT_SEC або dev > MAX_DEVIATION_BPS → фолбек
-    """
     tif = "GTX" if POST_ONLY else "GTC"
     price = _offset_price_from_book(symbol, side, tick)
     order_id = _entry_limit(symbol, side, qty, price, tif=tif)
@@ -639,7 +637,6 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
         except Exception as e:
             techlog({"level":"warn","msg":"entry_reprice_failed","err":str(e)})
 
-    # Вікно закінчилось → фолбек
     remain = max(0.0, qty - (filled_qty or 0.0))
     if remain > 0:
         try: _cancel_order_silent(symbol, order_id, "fallback")
@@ -667,7 +664,6 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     symbol=symbol.upper()
     ensure_oneway_mode(); ensure_leverage(symbol)
 
-    # зачистка «мертвої» скоби
     with BR_LOCK: has_local = symbol in BRACKETS
     if BINANCE and has_local and _position_amt(symbol)==0.0 and not _list_open_orders(symbol):
         with BR_LOCK: BRACKETS.pop(symbol,None)
@@ -675,7 +671,6 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
     pos_amt=_position_amt(symbol)
 
-    # IN-POSITION POLICY
     if pos_amt>0.0:
         if IN_POSITION_POLICY=="ignore":
             techlog({"level":"info","msg":"ignored_new_signal_active_position","id":signal_id,"symbol":symbol})
@@ -691,8 +686,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
                 techlog({"level":"warn","msg":"replace_market_close_failed","symbol":symbol,"err":str(e)})
             with BR_LOCK: BRACKETS.pop(symbol, None)
 
-    # розрахунки
-    price_ref = get_mark_price(symbol)     # для qty та контролю відхилення
+    price_ref = get_mark_price(symbol)
     qty  = compute_qty(symbol, price_ref)
     filt = fetch_symbol_filters(symbol)
     tick = filt.get("tickSize") or 0.0001
@@ -707,7 +701,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         px = _offset_price_from_book(symbol, side, tick)
         tif = "GTX" if POST_ONLY else "GTC"
         open_id = _entry_limit(symbol, side, qty, px, tif=tif)
-    else:  # maker_chase
+    else:
         open_id, filled = _entry_maker_chase(symbol, side, qty, tick, signal_id, price_ref)
         if filled <= 0.0 and FALLBACK == "none":
             techlog({"level":"info","msg":"no_entry_filled","symbol":symbol})
@@ -736,7 +730,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
 
 # ====== DEDUP ======
 def build_id(pattern, side, time_raw, entry_val):
-    entry_str = "{:.10f}".format(float(entry_val))  # уникаємо вкладених дужок всередині f-string
+    entry_str = "{:.10f}".format(float(entry_val))
     return f"{pattern}|{side}|{str(time_raw).lower()}|{entry_str}"
 
 def dedup_seen(key:str)->bool:
@@ -745,6 +739,52 @@ def dedup_seen(key:str)->bool:
     DEDUP[key]=True
     if len(DEDUP)>MAX_KEYS: DEDUP.popitem(last=False)
     return False
+
+# ====== REPORT ENDPOINT (нове) ======
+try:
+    import daily_report as DR
+except Exception:
+    DR = None
+
+try:
+    from send_mail import send_file as send_mail_file
+except Exception:
+    send_mail_file = None
+
+from zoneinfo import ZoneInfo
+KYIV = ZoneInfo("Europe/Kyiv")
+
+@app.route("/report/daily", methods=["POST"])
+def report_daily():
+    if ADMIN_TOKEN and request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
+        return jsonify({"status":"error","msg":"unauthorized"}), 401
+    if DR is None:
+        return jsonify({"status":"error","msg":"daily_report module not found"}), 500
+
+    day = request.args.get("day") or datetime.now(KYIV).strftime("%Y-%m-%d")
+    signals_glob = os.path.join(LOG_DIR, "*.csv")
+    execs_path   = os.path.join(LOG_DIR, EXEC_LOG)
+
+    try:
+        signals = DR.load_signals(signals_glob)
+        execs   = DR.load_execs(execs_path)
+        daily   = DR.build_daily(signals, execs, day)
+        out_path = os.path.join(REPORT_DIR, f"daily_trades_{day}.csv")
+        daily.to_csv(out_path, index=False)
+
+        sent = False
+        if daily.shape[0] > 0 and send_mail_file and EMAIL_TO:
+            try:
+                from pathlib import Path
+                send_mail_file(Path(out_path), f"Daily CSV — {day}")
+                sent = True
+            except Exception as e:
+                techlog({"level":"warn","msg":"email_failed","err":str(e)})
+
+        return jsonify({"status":"ok","rows":int(daily.shape[0]),"file":out_path,"email_sent":sent})
+    except Exception as e:
+        techlog({"level":"error","msg":"report_daily_failed","err":str(e)})
+        return jsonify({"status":"error","msg":str(e)}), 500
 
 # ====== INIT BINANCE & WORKERS ======
 if BINANCE_ENABLED and UMFutures:
@@ -774,7 +814,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.1.3-maker-chase+atomic-reprice+guard+log-rotation-safe+tp-market",
+        "status":"ok","version":"4.2.0-tpTPM+daily-report-endpoint",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
@@ -788,6 +828,7 @@ def healthz():
         "fallback": FALLBACK,
         "reprice_atomic": REPRICE_ATOMIC,
         "in_position_policy": IN_POSITION_POLICY,
+        "log_dir": LOG_DIR, "exec_log": EXEC_LOG, "report_dir": REPORT_DIR,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     })
 
@@ -858,7 +899,6 @@ def webhook():
         with BR_LOCK: BRACKETS.pop(symbol,None)
         techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":sig_id}); has_local=False
 
-    # IN-POSITION guard
     if (_position_amt(symbol)>0.0) and IN_POSITION_POLICY=="ignore":
         techlog({"level":"info","msg":"ignored_new_signal_active_position","id":sig_id,"symbol":symbol})
         return jsonify({"status":"ok","msg":"ignored_active_position","id":sig_id})
@@ -866,7 +906,6 @@ def webhook():
     if dedup_seen(sig_id):
         techlog({"level":"info","msg":"duplicate_ignored","id":sig_id}); return jsonify({"status":"ok","msg":"ignored","id":sig_id})
 
-    # log to CSV
     rotate_if_needed(CSV_PATH)
     newfile=not os.path.exists(CSV_PATH)
     with open(CSV_PATH,"a",newline="",encoding="utf-8") as f:
@@ -875,7 +914,6 @@ def webhook():
         w.writerow([data["time"], to_iso8601(data["time"]), symbol_tv, pattern, side, info["entry"], info["tp"], info["sl"], sig_id])
     techlog({"level":"info","msg":"logged","id":sig_id,"symbol":symbol_tv,"side":side})
 
-    # trade
     if BINANCE_ENABLED and BINANCE:
         try:
             place_orders_oneway(symbol, side, info["entry"], info["tp"], info["sl"], sig_id)
