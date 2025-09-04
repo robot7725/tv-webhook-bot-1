@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, json, csv, hmac, hashlib, threading, time, re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
 from collections import OrderedDict
 from flask import Flask, request, jsonify
@@ -8,11 +8,8 @@ from flask import Flask, request, jsonify
 # ====== CONFIG FROM ENV ======
 BINANCE_ENABLED = os.environ.get("TRADING_ENABLED", "false").lower() == "true"
 
-TESTNET  = os.environ.get("TESTNET", "false").lower() == "true"
 API_KEY_MAIN    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET_MAIN = os.environ.get("BINANCE_API_SECRET", "")
-API_KEY_TEST    = os.environ.get("BINANCE_API_KEY_TEST", "")
-API_SECRET_TEST = os.environ.get("BINANCE_API_SECRET_TEST", "")
 
 LEVERAGE   = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notional
@@ -33,6 +30,10 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 # Дозвіл на небезпечний вебхук лише свідомо
 ALLOW_INSECURE_WEBHOOK = os.environ.get("ALLOW_INSECURE_WEBHOOK", "false").lower() == "true"
+
+# Анти-replay параметри
+MAX_SIGNAL_AGE_SEC     = int(os.environ.get("MAX_SIGNAL_AGE_SEC", "90"))
+ALLOW_FUTURE_SKEW_SEC  = int(os.environ.get("ALLOW_FUTURE_SKEW_SEC", "10"))
 
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
 LOG_FILE  = os.environ.get("LOG_FILE", "inside.csv")
@@ -162,6 +163,13 @@ def to_iso8601(ts):
         if s.endswith("Z"): s=s[:-1]+"+00:00"
         return datetime.fromisoformat(s).astimezone(timezone.utc).isoformat().replace("+00:00","Z")
     except: return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+
+def parse_iso8601_to_dt(iso_str: str) -> datetime:
+    # очікує рядок 'YYYY-MM-DDTHH:MM:SS.sssZ'
+    s = iso_str
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).astimezone(timezone.utc)
 
 def calc_sig(raw: bytes) -> str:
     return hmac.new(SECRET.encode(), raw, hashlib.sha256).hexdigest() if SECRET else ""
@@ -800,11 +808,8 @@ def report_daily():
 # ====== INIT BINANCE & WORKERS ======
 if BINANCE_ENABLED and UMFutures:
     try:
-        if TESTNET:
-            BINANCE = UMFutures(key=API_KEY_TEST, secret=API_SECRET_TEST, base_url="https://testnet.binancefuture.com")
-        else:
-            BINANCE = UMFutures(key=API_KEY_MAIN, secret=API_SECRET_MAIN)
-        techlog({"level":"info","msg":"binance_client_ready","import_path":_BINANCE_IMPORT_PATH,"testnet":TESTNET})
+        BINANCE = UMFutures(key=API_KEY_MAIN, secret=API_SECRET_MAIN)
+        techlog({"level":"info","msg":"binance_client_ready","import_path":_BINANCE_IMPORT_PATH})
         ensure_oneway_mode()
         for s in PRESET_SYMBOLS:
             try: BINANCE.change_leverage(symbol=s, leverage=LEVERAGE); LEVERAGE_SET.add(s)
@@ -831,7 +836,7 @@ def root(): return "Bot is live", 200
 def healthz():
     base = {
         "status":"ok",
-        "version":"4.2.7-healthz-dual",
+        "version":"4.2.8-signal-age-no-testnet",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -844,7 +849,6 @@ def healthz():
     # ПОВНА ВІДПОВІДЬ ДЛЯ АДМІНА
     full = {
         **base,
-        "testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
         "preset_symbols":PRESET_SYMBOLS,"binance_import_path":_BINANCE_IMPORT_PATH,
         "poll_sec": BRACKET_POLL_SEC, "orphan_sweep_sec": ORPHAN_SWEEP_SEC,
@@ -859,6 +863,8 @@ def healthz():
         "log_dir": LOG_DIR, "exec_log": EXEC_LOG, "report_dir": REPORT_DIR,
         "webhook_secured": bool(SECRET),
         "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK,
+        "max_signal_age_sec": MAX_SIGNAL_AGE_SEC,
+        "allow_future_skew_sec": ALLOW_FUTURE_SKEW_SEC,
     }
     return jsonify(full)
 
@@ -873,14 +879,16 @@ def config():
             return jsonify({"status":"error","msg":"unauthorized"}), 401
         return jsonify({
             "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
-            "allow_pattern":ALLOW_PATTERN,"trading_enabled":BINANCE_ENABLED,"testnet":TESTNET,
+            "allow_pattern":ALLOW_PATTERN,"trading_enabled":BINANCE_ENABLED,
             "reprice_atomic":REPRICE_ATOMIC,"in_position_policy":IN_POSITION_POLICY,
             "entry_mode":ENTRY_MODE,"post_only":POST_ONLY,
             "offset_ticks":PRICE_OFFSET_TICKS,"offset_bps":PRICE_OFFSET_BPS,
             "chase_ms":CHASE_INTERVAL_MS,"chase_steps":CHASE_STEPS,
             "max_wait_sec":MAX_WAIT_SEC,"max_dev_bps":MAX_DEVIATION_BPS,"fallback":FALLBACK,
             "webhook_secured": bool(SECRET),
-            "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK
+            "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK,
+            "max_signal_age_sec": MAX_SIGNAL_AGE_SEC,
+            "allow_future_skew_sec": ALLOW_FUTURE_SKEW_SEC
         })
     # ---- POST: під токен ----
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","")!=ADMIN_TOKEN:
@@ -910,7 +918,7 @@ def config():
 def config_public():
     return jsonify({
         "status":"ok",
-        "version":"4.2.7-healthz-dual",
+        "version":"4.2.8-signal-age-no-testnet",
         "env": os.environ.get("ENV","prod"),
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     })
@@ -925,6 +933,23 @@ def validate_payload(d:dict):
     e=to_float(d["entry"]); t=to_float(d["tp"]); s=to_float(d["sl"])
     if e is None or t is None or s is None: return False, "entry/tp/sl must be numeric"
     return True, {"entry":e,"tp":t,"sl":s}
+
+def _check_signal_freshness(raw_time_value) -> tuple[bool, str]:
+    try:
+        t_iso = to_iso8601(raw_time_value)
+        t_dt  = parse_iso8601_to_dt(t_iso)
+        now   = datetime.now(timezone.utc)
+        diff  = now - t_dt
+        if diff.total_seconds() > MAX_SIGNAL_AGE_SEC:
+            return False, f"signal too old: age_sec={int(diff.total_seconds())}, max={MAX_SIGNAL_AGE_SEC}"
+        if diff.total_seconds() < 0:
+            # у майбутньому
+            fut = -diff.total_seconds()
+            if fut > ALLOW_FUTURE_SKEW_SEC:
+                return False, f"signal time too far in future: skew_sec={int(fut)}, max={ALLOW_FUTURE_SKEW_SEC}"
+        return True, ""
+    except Exception as e:
+        return False, f"bad time format: {str(e)}"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -949,6 +974,12 @@ def webhook():
     if not ok:
         techlog({"level":"warn","msg":"bad_payload","detail":info,"data":data})
         return jsonify({"status":"error","msg":info}),400
+
+    # ---- Перевірка "свіжості" сигналу ----
+    fresh_ok, fresh_msg = _check_signal_freshness(data["time"])
+    if not fresh_ok:
+        techlog({"level":"warn","msg":"stale_or_future_signal","detail":fresh_msg,"raw_time":str(data["time"])})
+        return jsonify({"status":"error","msg":fresh_msg}), 400
 
     symbol_tv=str(data["symbol"]); symbol=tv_to_binance_symbol(symbol_tv)
     side=str(data["side"]).lower(); pattern=str(data["pattern"]).lower()
