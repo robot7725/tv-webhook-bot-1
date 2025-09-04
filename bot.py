@@ -61,7 +61,7 @@ MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))  # доз�
 FALLBACK = os.environ.get("FALLBACK", "market").lower()               # none | market | limit_ioc
 
 # ====== Звіти (CSV only, без пошти) ======
-REPORT_DIR = os.environ.get("REPORT_DIR", os.path.join(LOG_DIR, "reports"))
+REPORT_DIR = os.path.join(LOG_DIR, "reports")
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
 
@@ -394,7 +394,7 @@ def _close_position_reduce_only(symbol, signal_id, reason="replace_close", wait_
                                   reduceOnly="true", quantity=qty)
             last_order_id = int(o.get("orderId"))
             techlog({"level":"info","msg":"replace_close_market_sent","symbol":symbol,"qty":qty,"id":last_order_id})
-            # лог CLOSE для цього ордера
+            # лог CLOSE
             vwap,qtyc,feec,assetc,rpn = _fetch_trades_for_order(symbol, last_order_id)
             exec_log(signal_id,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                      vwap,qtyc,feec,assetc,rpn,symbol,("long" if signed>0 else "short"),last_order_id)
@@ -402,7 +402,7 @@ def _close_position_reduce_only(symbol, signal_id, reason="replace_close", wait_
             techlog({"level":"warn","msg":"replace_close_market_failed","symbol":symbol,"err":str(e)})
             break
 
-        # чекаємо оновлення позиції
+        # очікуємо оновлення позиції
         t0 = time.time()
         while time.time() - t0 < 0.6:
             if abs(_position_signed_amt(symbol)) <= 0.0:
@@ -415,7 +415,6 @@ def _close_position_reduce_only(symbol, signal_id, reason="replace_close", wait_
             techlog({"level":"warn","msg":"replace_close_timeout","symbol":symbol,"remain":_position_signed_amt(symbol)})
             break
 
-    # прибираємо локальний BRACKET по символу
     with BR_LOCK:
         BRACKETS.pop(symbol, None)
     return last_order_id
@@ -430,7 +429,6 @@ def _bracket_monitor():
                 sid=b.get("id"); side=b.get("side")
                 tp_id=b.get("tp_id"); sl_id=b.get("sl_id")
 
-                # якщо плоскі: не чіпаємо entry; прибираємо лише сирітські exits
                 if _position_amt(symbol)==0.0:
                     entries, exits = _split_open_orders(symbol)
                     if entries:
@@ -447,7 +445,6 @@ def _bracket_monitor():
                     techlog({"level":"info","msg":"bracket_removed_flat_no_orders","symbol":symbol})
                     continue
 
-                # позиція є: відслідковуємо спрацювання TP/SL
                 if tp_id:
                     st=_get_order_status(symbol, tp_id)
                     if st=="FILLED":
@@ -759,72 +756,36 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
         techlog({"level":"info","msg":"fallback_none","symbol":symbol,"filled":filled_qty,"remain":remain})
         return order_id, filled_qty
 
-def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
-    symbol=symbol.upper()
-    ensure_oneway_mode(); ensure_leverage(symbol)
-
-    with BR_LOCK: has_local = symbol in BRACKETS
-    if BINANCE and has_local and _position_amt(symbol)==0.0 and not _list_open_orders(symbol):
-        with BR_LOCK: BRACKETS.pop(symbol,None)
-        techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":signal_id}); has_local=False
-
-    pos_amt=_position_amt(symbol)
-
-    if pos_amt>0.0:
-        if IN_POSITION_POLICY=="ignore":
-            techlog({"level":"info","msg":"ignored_new_signal_active_position","id":signal_id,"symbol":symbol})
-            return {"status":"ok","msg":"ignored_active_position","id":signal_id}
-        elif IN_POSITION_POLICY=="replace":
-            # коректно закриваємо стару позицію reduceOnly + відміняємо виходи
-            _close_position_reduce_only(symbol, signal_id, reason="replace")
-            # після закриття продовжуємо до нового входу
-
-    price_ref = get_mark_price(symbol)
-    qty  = compute_qty(symbol, price_ref)
-    filt = fetch_symbol_filters(symbol)
-    tick = filt.get("tickSize") or 0.0001
-
-    tp_r = p_floor_to_tick(float(tp), tick)
-    sl_r = p_floor_to_tick(float(sl), tick)
-
-    # ===== Вхід =====
-    if ENTRY_MODE == "market":
-        open_id = _entry_market(symbol, side, qty)
-    elif ENTRY_MODE == "limit":
-        px = _offset_price_from_book(symbol, side, tick)
-        tif = "GTX" if POST_ONLY else "GTC"
-        open_id = _entry_limit(symbol, side, qty, px, tif=tif)
-    else:
-        open_id, filled = _entry_maker_chase(symbol, side, qty, tick, signal_id, price_ref)
-        if filled <= 0.0 and FALLBACK == "none":
-            techlog({"level":"info","msg":"no_entry_filled","symbol":symbol})
-            return {"skipped":True,"reason":"no_filled"}
-        time.sleep(0.2)
-        pos_amt_now = _position_amt(symbol)
-        if pos_amt_now > 0:
-            qty = pos_amt_now
-
-    with BR_LOCK:
-        BRACKETS[symbol] = {
-            "id":signal_id,"side":side,"tp_id":None,"sl_id":None,
-            "open_order_id":open_id,"ts":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-        }
-    techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
-
-    # Запис OPEN
-    vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
-    exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-             vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
-
-    # ===== Виходи =====
-    tp_id, sl_id = _place_exits(symbol, side, qty, tp_r, sl_r, signal_id)
-
-    return {"qty":qty,"price_ref":price_ref,"tp":tp_r,"sl":sl_r,"open_order_id":open_id,"tp_id":tp_id,"sl_id":sl_id}
-
 # ====== DEDUP ======
-def build_id(pattern, side, time_raw, entry_val):
-    entry_str = "{:.10f}".format(float(entry_val))
-    return f"{pattern}|{side}|{str(time_raw).lower()}|{entry_str}"
+def _format_price_for_key(val: float, tick: float|None) -> str:
+    try:
+        v = float(val)
+    except:
+        return "nan"
+    if tick and tick > 0:
+        v = p_floor_to_tick(v, tick)
+    return "{:.10f}".format(v)
+
+def build_id(symbol: str, pattern: str, side: str, time_raw, entry_val, tp_val, sl_val):
+    """
+    Стабільний ключ:
+    SYMBOL | PATTERN | SIDE | ISO_TIME | e:ENTRY | tp:TP | sl:SL
+    Ціни нормалізуємо по tickSize, якщо можемо, інакше беремо 10 знаків.
+    """
+    sym = str(symbol).upper()
+    t_iso = to_iso8601(time_raw)
+    # спробуємо дістати tickSize; якщо BINANCE недоступний — skip
+    tick = None
+    try:
+        if BINANCE:
+            filt = fetch_symbol_filters(sym)
+            tick = float(filt.get("tickSize") or 0.0)
+    except:
+        tick = None
+    e_str  = _format_price_for_key(entry_val, tick)
+    tp_str = _format_price_for_key(tp_val, tick)
+    sl_str = _format_price_for_key(sl_val, tick)
+    return f"{sym}|{pattern}|{side}|{t_iso}|e:{e_str}|tp:{tp_str}|sl:{sl_str}"
 
 def dedup_seen(key:str)->bool:
     if key in DEDUP:
@@ -859,7 +820,6 @@ def report_daily():
         daily   = DR.build_daily(signals, execs, day)
         out_path = os.path.join(REPORT_DIR, f"daily_trades_{day}.csv")
         daily.to_csv(out_path, index=False)
-
         return jsonify({"status":"ok","rows":int(daily.shape[0]),"file":out_path,"email_sent":False})
     except Exception as e:
         techlog({"level":"error","msg":"report_daily_failed","err":str(e)})
@@ -893,7 +853,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.2.3-replace-safe-close",
+        "status":"ok","version":"4.2.4-dedup-fix",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
@@ -969,7 +929,13 @@ def webhook():
 
     symbol_tv=str(data["symbol"]); symbol=tv_to_binance_symbol(symbol_tv)
     side=str(data["side"]).lower(); pattern=str(data["pattern"]).lower()
-    sig_id=build_id(pattern, side, str(data["time"]), float(info["entry"]))
+
+    # якщо джерело дає зовнішній id — використовуємо його
+    ext_id = str(data.get("id") or data.get("signal_id") or "").strip()
+    if ext_id:
+        sig_id = f"ext|{ext_id}"
+    else:
+        sig_id = build_id(symbol, pattern, side, data["time"], info["entry"], info["tp"], info["sl"])
 
     print("[WEBHOOK_OK] id={} data={}".format(sig_id, json.dumps(data, ensure_ascii=False)), flush=True)
 
@@ -1003,6 +969,66 @@ def webhook():
         techlog({"level":"info","msg":"trading_disabled","id":sig_id})
 
     return jsonify({"status":"ok","msg":"logged","id":sig_id})
+
+def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
+    symbol=symbol.upper()
+    ensure_oneway_mode(); ensure_leverage(symbol)
+
+    with BR_LOCK: has_local = symbol in BRACKETS
+    if BINANCE and has_local and _position_amt(symbol)==0.0 and not _list_open_orders(symbol):
+        with BR_LOCK: BRACKETS.pop(symbol,None)
+        techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":signal_id}); has_local=False
+
+    pos_amt=_position_amt(symbol)
+
+    if pos_amt>0.0:
+        if IN_POSITION_POLICY=="ignore":
+            techlog({"level":"info","msg":"ignored_new_signal_active_position","id":signal_id,"symbol":symbol})
+            return {"status":"ok","msg":"ignored_active_position","id":signal_id}
+        elif IN_POSITION_POLICY=="replace":
+            _close_position_reduce_only(symbol, signal_id, reason="replace")
+
+    price_ref = get_mark_price(symbol)
+    qty  = compute_qty(symbol, price_ref)
+    filt = fetch_symbol_filters(symbol)
+    tick = filt.get("tickSize") or 0.0001
+
+    tp_r = p_floor_to_tick(float(tp), tick)
+    sl_r = p_floor_to_tick(float(sl), tick)
+
+    # ===== Вхід =====
+    if ENTRY_MODE == "market":
+        open_id = _entry_market(symbol, side, qty)
+    elif ENTRY_MODE == "limit":
+        px = _offset_price_from_book(symbol, side, tick)
+        tif = "GTX" if POST_ONLY else "GTC"
+        open_id = _entry_limit(symbol, side, qty, px, tif=tif)
+    else:
+        open_id, filled = _entry_maker_chase(symbol, side, qty, tick, signal_id, price_ref)
+        if filled <= 0.0 and FALLBACK == "none":
+            techlog({"level":"info","msg":"no_entry_filled","symbol":symbol})
+            return {"skipped":True,"reason":"no_filled"}
+        time.sleep(0.2)
+        pos_amt_now = _position_amt(symbol)
+        if pos_amt_now > 0:
+            qty = pos_amt_now
+
+    with BR_LOCK:
+        BRACKETS[symbol] = {
+            "id":signal_id,"side":side,"tp_id":None,"sl_id":None,
+            "open_order_id":open_id,"ts":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+        }
+    techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
+
+    # Запис OPEN
+    vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
+    exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+             vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
+
+    # ===== Виходи =====
+    tp_id, sl_id = _place_exits(symbol, side, qty, tp_r, sl_r, signal_id)
+
+    return {"qty":qty,"price_ref":price_ref,"tp":tp_r,"sl":sl_r,"open_order_id":open_id,"tp_id":tp_id,"sl_id":sl_id}
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","5000")))
