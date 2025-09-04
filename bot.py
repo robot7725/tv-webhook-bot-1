@@ -18,12 +18,12 @@ LEVERAGE   = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notional
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
 
-# дефолт патерну виправлено на "inside"
+# дефолт патерну = inside
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "inside").lower()
-# прапорець атомарного cancelReplace під час chase
+# атомарний cancelReplace під час chase
 REPRICE_ATOMIC = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 
-# Політика поведінки при наявній позиції: ignore | replace
+# Політика: ignore | replace
 IN_POSITION_POLICY = os.environ.get("IN_POSITION_POLICY", "ignore").lower()
 
 PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","").split(",") if x.strip()]
@@ -32,7 +32,6 @@ SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
-# дефолт лог-файлу виправлено на inside.csv
 LOG_FILE  = os.environ.get("LOG_FILE", "inside.csv")
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
 EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")
@@ -256,6 +255,15 @@ def _position_amt(symbol)->float:
     except: pass
     return 0.0
 
+# NEW: знак і абсолют позиції
+def _position_signed_amt(symbol)->float:
+    try:
+        for p in _fetch_positions(symbol):
+            if str(p.get("symbol","")).upper()==symbol.upper():
+                return float(p.get("positionAmt") or 0.0)
+    except: pass
+    return 0.0
+
 def _get_order_status(symbol, order_id:int) -> str:
     try: od = BINANCE.get_order(symbol=symbol, orderId=order_id)
     except: od = BINANCE.query_order(symbol=symbol, orderId=order_id)
@@ -284,7 +292,7 @@ def _list_open_orders(symbol=None):
                     continue
     return []
 
-# ---- NEW: класифікація відкритих ордерів (entry vs exit) ----
+# ---- Класифікація відкритих ордерів (entry vs exit) ----
 def _split_open_orders(symbol):
     """
     Повертає (entry_orders, exit_orders).
@@ -355,6 +363,63 @@ def _cancel_all_silent(symbol, reason):
             time.sleep(0.3)
     techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":err,"reason":reason})
 
+# NEW: прибрати тільки виходи по символу
+def _cancel_exits_for_symbol(symbol, reason):
+    _entries, exits = _split_open_orders(symbol)
+    for od in exits:
+        _cancel_order_silent(symbol, int(od.get("orderId",0)), reason)
+
+# NEW: коректне reduce-only закриття всієї позиції з очікуванням плоского стану
+def _close_position_reduce_only(symbol, signal_id, reason="replace_close", wait_sec=5.0):
+    signed = _position_signed_amt(symbol)
+    if signed == 0.0:
+        return None
+    # зносимо виходи, щоб не заважали закриттю
+    _cancel_exits_for_symbol(symbol, reason + "_cancel_exits")
+
+    side_to_close = "SELL" if signed > 0 else "BUY"
+    filt = fetch_symbol_filters(symbol); step = filt.get("stepSize") or 0.001
+    last_order_id = None
+
+    deadline = time.time() + max(0.5, wait_sec)
+    while True:
+        amt = abs(_position_signed_amt(symbol))
+        if amt <= 0.0:
+            break
+        qty = q_floor_to_step(amt, step)
+        if qty <= 0.0:
+            break
+        try:
+            o = BINANCE.new_order(symbol=symbol, side=side_to_close, type="MARKET",
+                                  reduceOnly="true", quantity=qty)
+            last_order_id = int(o.get("orderId"))
+            techlog({"level":"info","msg":"replace_close_market_sent","symbol":symbol,"qty":qty,"id":last_order_id})
+            # лог CLOSE для цього ордера
+            vwap,qtyc,feec,assetc,rpn = _fetch_trades_for_order(symbol, last_order_id)
+            exec_log(signal_id,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                     vwap,qtyc,feec,assetc,rpn,symbol,("long" if signed>0 else "short"),last_order_id)
+        except Exception as e:
+            techlog({"level":"warn","msg":"replace_close_market_failed","symbol":symbol,"err":str(e)})
+            break
+
+        # чекаємо оновлення позиції
+        t0 = time.time()
+        while time.time() - t0 < 0.6:
+            if abs(_position_signed_amt(symbol)) <= 0.0:
+                break
+            time.sleep(0.1)
+
+        if abs(_position_signed_amt(symbol)) <= 0.0:
+            break
+        if time.time() >= deadline:
+            techlog({"level":"warn","msg":"replace_close_timeout","symbol":symbol,"remain":_position_signed_amt(symbol)})
+            break
+
+    # прибираємо локальний BRACKET по символу
+    with BR_LOCK:
+        BRACKETS.pop(symbol, None)
+    return last_order_id
+
 # ====== BRACKET MONITOR ======
 def _bracket_monitor():
     while True:
@@ -365,30 +430,24 @@ def _bracket_monitor():
                 sid=b.get("id"); side=b.get("side")
                 tp_id=b.get("tp_id"); sl_id=b.get("sl_id")
 
-                # --- якщо ми плоскі, не зносимо entry-ордера ---
+                # якщо плоскі: не чіпаємо entry; прибираємо лише сирітські exits
                 if _position_amt(symbol)==0.0:
                     entries, exits = _split_open_orders(symbol)
-
                     if entries:
-                        # Є ліміт/чейз на вхід — не чіпаємо нічого.
                         techlog({"level":"debug","msg":"flat_but_entry_present","symbol":symbol,"entries":len(entries),"exits":len(exits)})
                         continue
-
                     if exits:
-                        # Сирітські виходи без позиції та без entry — приберемо тільки їх.
                         for od in exits:
                             oid = int(od.get("orderId", 0))
                             _cancel_order_silent(symbol, oid, "pos_is_zero_exit_cleanup")
                         with BR_LOCK: BRACKETS.pop(symbol, None)
                         techlog({"level":"info","msg":"exit_orphans_cleaned_flat","symbol":symbol,"count":len(exits)})
                         continue
-
-                    # Немає ні entry, ні exit — чистимо локальний стан, якщо зостався.
                     with BR_LOCK: BRACKETS.pop(symbol, None)
                     techlog({"level":"info","msg":"bracket_removed_flat_no_orders","symbol":symbol})
                     continue
 
-                # --- позиція є: слідкуємо за TP/SL ---
+                # позиція є: відслідковуємо спрацювання TP/SL
                 if tp_id:
                     st=_get_order_status(symbol, tp_id)
                     if st=="FILLED":
@@ -429,7 +488,6 @@ def _recover_state():
             entries, exits = _split_open_orders(s)
 
             if amt == 0.0:
-                # Ми плоскі: не чіпаємо pending-entries; прибираємо лише сирітські exits (якщо немає entries).
                 if entries:
                     techlog({"level":"info","msg":"recover_flat_keep_entries","symbol":s,"entries":len(entries),"exits":len(exits)})
                     continue
@@ -439,7 +497,7 @@ def _recover_state():
                     techlog({"level":"info","msg":"recover_exit_orphans_cleaned","symbol":s,"count":len(exits)})
                 continue
 
-            # Позиція є: відновлюємо ідентифікатори TP/SL.
+            # Позиція є: відновлюємо TP/SL
             tp_id = sl_id = None
             for od in orders:
                 typ = str(od.get("type","")).upper()
@@ -451,7 +509,7 @@ def _recover_state():
                 if typ in ("STOP","STOP_MARKET") and (cp or ro):
                     sl_id = oid
 
-            side = "long" if any(float(p.get("positionAmt",0))>0 for p in _fetch_positions(s)) else "short"
+            side = "long" if _position_signed_amt(s) > 0 else "short"
             with BR_LOCK:
                 BRACKETS[s] = {
                     "id": f"recover|{s}|{int(time.time())}",
@@ -483,7 +541,6 @@ def _orphan_sweeper():
                 try:
                     if _position_amt(s) == 0.0:
                         entries, exits = _split_open_orders(s)
-                        # лишаємо entry-ордера в спокої; прибираємо тільки сирітські виходи за відсутності entries
                         if (not entries) and exits:
                             for od in exits:
                                 _cancel_order_silent(s, int(od.get("orderId",0)), "orphan_sweeper_exit_only")
@@ -718,15 +775,9 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
             techlog({"level":"info","msg":"ignored_new_signal_active_position","id":signal_id,"symbol":symbol})
             return {"status":"ok","msg":"ignored_active_position","id":signal_id}
         elif IN_POSITION_POLICY=="replace":
-            try:
-                exit_side="SELL" if side=="long" else "BUY"
-                filt=fetch_symbol_filters(symbol); step=filt.get("stepSize") or 0.001
-                BINANCE.new_order(symbol=symbol, side=exit_side, type="MARKET", reduceOnly="true",
-                                  quantity=q_floor_to_step(pos_amt, step))
-                techlog({"level":"info","msg":"replaced_old_position","symbol":symbol,"qty":pos_amt})
-            except Exception as e:
-                techlog({"level":"warn","msg":"replace_market_close_failed","symbol":symbol,"err":str(e)})
-            with BR_LOCK: BRACKETS.pop(symbol, None)
+            # коректно закриваємо стару позицію reduceOnly + відміняємо виходи
+            _close_position_reduce_only(symbol, signal_id, reason="replace")
+            # після закриття продовжуємо до нового входу
 
     price_ref = get_mark_price(symbol)
     qty  = compute_qty(symbol, price_ref)
@@ -760,7 +811,7 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         }
     techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
 
-    # Запис OPEN (при LIMIT/CHASE може бути ще не повністю заповнений)
+    # Запис OPEN
     vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
     exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
              vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
@@ -809,9 +860,7 @@ def report_daily():
         out_path = os.path.join(REPORT_DIR, f"daily_trades_{day}.csv")
         daily.to_csv(out_path, index=False)
 
-        # пошту не шлемо
-        sent = False
-        return jsonify({"status":"ok","rows":int(daily.shape[0]),"file":out_path,"email_sent":sent})
+        return jsonify({"status":"ok","rows":int(daily.shape[0]),"file":out_path,"email_sent":False})
     except Exception as e:
         techlog({"level":"error","msg":"report_daily_failed","err":str(e)})
         return jsonify({"status":"error","msg":str(e)}), 500
@@ -844,7 +893,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.2.2-exit-only-sweep",
+        "status":"ok","version":"4.2.3-replace-safe-close",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
