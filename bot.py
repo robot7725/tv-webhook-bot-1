@@ -18,7 +18,7 @@ LEVERAGE   = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notional
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
 
-# дефолт патерну = inside
+# дефолт патерну = inside (узгоджено)
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "inside").lower()
 # атомарний cancelReplace під час chase
 REPRICE_ATOMIC = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
@@ -31,7 +31,7 @@ PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","")
 SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-# Нове: керування безпечністю вебхука
+# Нове: дозволити небезпечний вебхук лише свідомо
 ALLOW_INSECURE_WEBHOOK = os.environ.get("ALLOW_INSECURE_WEBHOOK", "false").lower() == "true"
 
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
@@ -167,29 +167,18 @@ def calc_sig(raw: bytes) -> str:
     return hmac.new(SECRET.encode(), raw, hashlib.sha256).hexdigest() if SECRET else ""
 
 def _require_signature() -> bool:
-    """Чи повинні ми вимагати підпис вебхука."""
-    # Якщо секрет не заданий і «небезпечний режим» не дозволено — підпис обов'язковий, але розрахувати нічим -> забороняємо.
     if not SECRET and not ALLOW_INSECURE_WEBHOOK:
         return True
-    # Якщо секрет заданий — теж вимагаємо підпис.
     if SECRET:
         return True
-    # Інакше (секрет порожній і явно дозволено небезпечний режим) — не вимагаємо.
     return False
 
 def valid_sig(req):
-    """
-    Валідний підпис:
-      - SECRET має бути заданий (або дозволений небезпечний режим);
-      - якщо SECRET заданий, у заголовку має бути X-Signature = HMAC_SHA256(SECRET, rawBody)
-    """
     if not SECRET:
-        # Без секрету: пропускаємо тільки якщо явно дозволено небезпечний режим
         if ALLOW_INSECURE_WEBHOOK:
             techlog({"level":"warn","msg":"insecure_webhook_allowed"})
             return True
         return False
-
     sig = req.headers.get("X-Signature", "")
     if not sig:
         return False
@@ -285,7 +274,6 @@ def _position_amt(symbol)->float:
     except: pass
     return 0.0
 
-# NEW: знак і абсолют позиції
 def _position_signed_amt(symbol)->float:
     try:
         for p in _fetch_positions(symbol):
@@ -322,7 +310,6 @@ def _list_open_orders(symbol=None):
                     continue
     return []
 
-# ---- Класифікація відкритих ордерів (entry vs exit) ----
 def _split_open_orders(symbol):
     orders = _list_open_orders(symbol) or []
     entries, exits = [], []
@@ -837,7 +824,7 @@ def root(): return "Bot is live", 200
 @app.route("/healthz")
 def healthz():
     return jsonify({
-        "status":"ok","version":"4.2.5-webhook-secured",
+        "status":"ok","version":"4.2.6-config-protect",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
@@ -852,7 +839,6 @@ def healthz():
         "reprice_atomic": REPRICE_ATOMIC,
         "in_position_policy": IN_POSITION_POLICY,
         "log_dir": LOG_DIR, "exec_log": EXEC_LOG, "report_dir": REPORT_DIR,
-        # стан безпеки вебхука
         "webhook_secured": bool(SECRET),
         "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -861,16 +847,24 @@ def healthz():
 @app.route("/config", methods=["GET","POST"])
 def config():
     global RISK_MODE,RISK_PCT,LEVERAGE
+    # ---- GET: тепер під токен ----
     if request.method=="GET":
-        return jsonify({"risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
-                        "allow_pattern":ALLOW_PATTERN,"trading_enabled":BINANCE_ENABLED,"testnet":TESTNET,
-                        "reprice_atomic":REPRICE_ATOMIC,"in_position_policy":IN_POSITION_POLICY,
-                        "entry_mode":ENTRY_MODE,"post_only":POST_ONLY,
-                        "offset_ticks":PRICE_OFFSET_TICKS,"offset_bps":PRICE_OFFSET_BPS,
-                        "chase_ms":CHASE_INTERVAL_MS,"chase_steps":CHASE_STEPS,
-                        "max_wait_sec":MAX_WAIT_SEC,"max_dev_bps":MAX_DEVIATION_BPS,"fallback":FALLBACK,
-                        "webhook_secured": bool(SECRET),
-                        "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK})
+        if not ADMIN_TOKEN:
+            return jsonify({"status":"error","msg":"admin token not set"}), 401
+        if request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
+            return jsonify({"status":"error","msg":"unauthorized"}), 401
+        return jsonify({
+            "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
+            "allow_pattern":ALLOW_PATTERN,"trading_enabled":BINANCE_ENABLED,"testnet":TESTNET,
+            "reprice_atomic":REPRICE_ATOMIC,"in_position_policy":IN_POSITION_POLICY,
+            "entry_mode":ENTRY_MODE,"post_only":POST_ONLY,
+            "offset_ticks":PRICE_OFFSET_TICKS,"offset_bps":PRICE_OFFSET_BPS,
+            "chase_ms":CHASE_INTERVAL_MS,"chase_steps":CHASE_STEPS,
+            "max_wait_sec":MAX_WAIT_SEC,"max_dev_bps":MAX_DEVIATION_BPS,"fallback":FALLBACK,
+            "webhook_secured": bool(SECRET),
+            "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK
+        })
+    # ---- POST: без змін, під токен ----
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","")!=ADMIN_TOKEN:
         return jsonify({"status":"error","msg":"unauthorized"}),401
     data=request.get_json(force=True,silent=True) or {}
@@ -893,6 +887,16 @@ def config():
     techlog({"level":"info","msg":"config_updated","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
     return jsonify({"status":"ok","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
 
+# ---- Нове: публічний, «безпечний» ендпойнт з мінімальною інформацією ----
+@app.route("/config/public", methods=["GET"])
+def config_public():
+    return jsonify({
+        "status":"ok",
+        "version":"4.2.6-config-protect",
+        "env": os.environ.get("ENV","prod"),
+        "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    })
+
 def validate_payload(d:dict):
     req = ["signal","symbol","time","side","pattern","entry","tp","sl"]
     miss=[k for k in req if k not in d]
@@ -906,12 +910,9 @@ def validate_payload(d:dict):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Забороняємо роботу без секрету, якщо не дозволено явним прапорцем
     if _require_signature() and not SECRET:
         techlog({"level":"warn","msg":"webhook_secret_missing"})
         return jsonify({"status":"error","msg":"webhook secret not set"}), 401
-
-    # Якщо секрет заданий — вимагаємо валідний підпис
     if SECRET:
         sig_hdr = request.headers.get("X-Signature", "")
         if not sig_hdr:
@@ -920,7 +921,6 @@ def webhook():
         if not valid_sig(request):
             techlog({"level":"warn","msg":"bad_signature"})
             return jsonify({"status":"error","msg":"bad signature"}), 401
-
     try:
         data=request.get_json(force=True, silent=False)
     except Exception as e:
@@ -935,7 +935,6 @@ def webhook():
     symbol_tv=str(data["symbol"]); symbol=tv_to_binance_symbol(symbol_tv)
     side=str(data["side"]).lower(); pattern=str(data["pattern"]).lower()
 
-    # зовнішній id (якщо є)
     ext_id = str(data.get("id") or data.get("signal_id") or "").strip()
     if ext_id:
         sig_id = f"ext|{ext_id}"
