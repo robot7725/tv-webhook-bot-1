@@ -2,7 +2,7 @@
 import os, json, csv, hmac, hashlib, threading, time, re
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from flask import Flask, request, jsonify
 
 # ====== CONFIG FROM ENV ======
@@ -34,6 +34,10 @@ ALLOW_INSECURE_WEBHOOK = os.environ.get("ALLOW_INSECURE_WEBHOOK", "false").lower
 # Анти-replay параметри
 MAX_SIGNAL_AGE_SEC     = int(os.environ.get("MAX_SIGNAL_AGE_SEC", "90"))
 ALLOW_FUTURE_SKEW_SEC  = int(os.environ.get("ALLOW_FUTURE_SKEW_SEC", "10"))
+
+# Анти-флуд параметри
+MAX_WEBHOOKS_PER_MIN = int(os.environ.get("MAX_WEBHOOKS_PER_MIN", "120"))
+MIN_SEC_BETWEEN_TRADES_PER_SYMBOL = float(os.environ.get("MIN_SEC_BETWEEN_TRADES_PER_SYMBOL", "1.5"))
 
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
 LOG_FILE  = os.environ.get("LOG_FILE", "inside.csv")
@@ -104,6 +108,11 @@ DEDUP = OrderedDict()
 BRACKETS = {}
 BR_LOCK = threading.RLock()
 
+# Anti-flood state
+WEBHOOK_TIMESTAMPS = deque(maxlen=10000)  # глобальні мітки часу останніх запитів
+LAST_SYMBOL_ACCEPT = {}                   # symbol -> last accept timestamp
+RL_LOCK = threading.RLock()
+
 # ====== ROTATION (safe) ======
 def rotate_if_needed(path: str):
     try:
@@ -165,7 +174,6 @@ def to_iso8601(ts):
     except: return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
 
 def parse_iso8601_to_dt(iso_str: str) -> datetime:
-    # очікує рядок 'YYYY-MM-DDTHH:MM:SS.sssZ'
     s = iso_str
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
@@ -828,6 +836,32 @@ def _is_admin(req) -> bool:
         return False
     return req.headers.get("X-Admin-Token","") == ADMIN_TOKEN
 
+def _rate_limit_check(symbol: str) -> tuple[bool, str]:
+    now = time.time()
+    with RL_LOCK:
+        # purge старі глобальні таймстемпи
+        if WEBHOOK_TIMESTAMPS:
+            while WEBHOOK_TIMESTAMPS and (now - WEBHOOK_TIMESTAMPS[0] > 60.0):
+                WEBHOOK_TIMESTAMPS.popleft()
+
+        # глобальний ліміт
+        if MAX_WEBHOOKS_PER_MIN > 0 and len(WEBHOOK_TIMESTAMPS) >= MAX_WEBHOOKS_PER_MIN:
+            return False, f"global rate limit exceeded: {len(WEBHOOK_TIMESTAMPS)}/{MAX_WEBHOOKS_PER_MIN} in last 60s"
+
+        # ліміт по символу
+        if MIN_SEC_BETWEEN_TRADES_PER_SYMBOL > 0:
+            last = LAST_SYMBOL_ACCEPT.get(symbol)
+            if last is not None:
+                dt = now - last
+                if dt < MIN_SEC_BETWEEN_TRADES_PER_SYMBOL:
+                    wait = max(0.0, MIN_SEC_BETWEEN_TRADES_PER_SYMBOL - dt)
+                    return False, f"symbol rate limit: wait {wait:.2f}s"
+
+        # якщо все ок — реєструємо споживання квоти
+        WEBHOOK_TIMESTAMPS.append(now)
+        LAST_SYMBOL_ACCEPT[symbol] = now
+        return True, ""
+
 # ====== ROUTES ======
 @app.route("/")
 def root(): return "Bot is live", 200
@@ -836,17 +870,15 @@ def root(): return "Bot is live", 200
 def healthz():
     base = {
         "status":"ok",
-        "version":"4.2.8-signal-age-no-testnet",
+        "version":"4.2.9-rate-limit",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     }
     if not _is_admin(request):
-        # ПУБЛІЧНА, БЕЗПЕЧНА ВІДПОВІДЬ
         base["webhook_secured"] = bool(SECRET) and not ALLOW_INSECURE_WEBHOOK
         return jsonify(base)
 
-    # ПОВНА ВІДПОВІДЬ ДЛЯ АДМІНА
     full = {
         **base,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
@@ -865,13 +897,14 @@ def healthz():
         "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK,
         "max_signal_age_sec": MAX_SIGNAL_AGE_SEC,
         "allow_future_skew_sec": ALLOW_FUTURE_SKEW_SEC,
+        "max_webhooks_per_min": MAX_WEBHOOKS_PER_MIN,
+        "min_sec_between_trades_per_symbol": MIN_SEC_BETWEEN_TRADES_PER_SYMBOL,
     }
     return jsonify(full)
 
 @app.route("/config", methods=["GET","POST"])
 def config():
     global RISK_MODE,RISK_PCT,LEVERAGE
-    # ---- GET: під токен ----
     if request.method=="GET":
         if not ADMIN_TOKEN:
             return jsonify({"status":"error","msg":"admin token not set"}), 401
@@ -888,9 +921,10 @@ def config():
             "webhook_secured": bool(SECRET),
             "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK,
             "max_signal_age_sec": MAX_SIGNAL_AGE_SEC,
-            "allow_future_skew_sec": ALLOW_FUTURE_SKEW_SEC
+            "allow_future_skew_sec": ALLOW_FUTURE_SKEW_SEC,
+            "max_webhooks_per_min": MAX_WEBHOOKS_PER_MIN,
+            "min_sec_between_trades_per_symbol": MIN_SEC_BETWEEN_TRADES_PER_SYMBOL
         })
-    # ---- POST: під токен ----
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","")!=ADMIN_TOKEN:
         return jsonify({"status":"error","msg":"unauthorized"}),401
     data=request.get_json(force=True,silent=True) or {}
@@ -918,7 +952,7 @@ def config():
 def config_public():
     return jsonify({
         "status":"ok",
-        "version":"4.2.8-signal-age-no-testnet",
+        "version":"4.2.9-rate-limit",
         "env": os.environ.get("ENV","prod"),
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     })
@@ -943,7 +977,6 @@ def _check_signal_freshness(raw_time_value) -> tuple[bool, str]:
         if diff.total_seconds() > MAX_SIGNAL_AGE_SEC:
             return False, f"signal too old: age_sec={int(diff.total_seconds())}, max={MAX_SIGNAL_AGE_SEC}"
         if diff.total_seconds() < 0:
-            # у майбутньому
             fut = -diff.total_seconds()
             if fut > ALLOW_FUTURE_SKEW_SEC:
                 return False, f"signal time too far in future: skew_sec={int(fut)}, max={ALLOW_FUTURE_SKEW_SEC}"
@@ -975,7 +1008,7 @@ def webhook():
         techlog({"level":"warn","msg":"bad_payload","detail":info,"data":data})
         return jsonify({"status":"error","msg":info}),400
 
-    # ---- Перевірка "свіжості" сигналу ----
+    # Свіжість сигналу
     fresh_ok, fresh_msg = _check_signal_freshness(data["time"])
     if not fresh_ok:
         techlog({"level":"warn","msg":"stale_or_future_signal","detail":fresh_msg,"raw_time":str(data["time"])})
@@ -983,6 +1016,13 @@ def webhook():
 
     symbol_tv=str(data["symbol"]); symbol=tv_to_binance_symbol(symbol_tv)
     side=str(data["side"]).lower(); pattern=str(data["pattern"]).lower()
+
+    # Анти-флуд
+    rl_ok, rl_msg = _rate_limit_check(symbol)
+    if not rl_ok:
+        techlog({"level":"warn","msg":"rate_limit","type":("global" if "global" in rl_msg else "symbol"),
+                 "symbol":symbol,"detail":rl_msg})
+        return jsonify({"status":"error","msg":rl_msg}), 429
 
     ext_id = str(data.get("id") or data.get("signal_id") or "").strip()
     if ext_id:
