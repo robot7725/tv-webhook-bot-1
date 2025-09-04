@@ -31,7 +31,7 @@ PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","")
 SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-# Нове: дозволити небезпечний вебхук лише свідомо
+# Дозвіл на небезпечний вебхук лише свідомо
 ALLOW_INSECURE_WEBHOOK = os.environ.get("ALLOW_INSECURE_WEBHOOK", "false").lower() == "true"
 
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
@@ -817,16 +817,34 @@ if BINANCE_ENABLED and UMFutures:
         techlog({"level":"warn","msg":"binance_client_init_failed","err":str(e)})
         BINANCE_ENABLED=False; BINANCE=None
 
+# ====== HELPERS ======
+def _is_admin(req) -> bool:
+    if not ADMIN_TOKEN:
+        return False
+    return req.headers.get("X-Admin-Token","") == ADMIN_TOKEN
+
 # ====== ROUTES ======
 @app.route("/")
 def root(): return "Bot is live", 200
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({
-        "status":"ok","version":"4.2.6-config-protect",
+    base = {
+        "status":"ok",
+        "version":"4.2.7-healthz-dual",
         "env": os.environ.get("ENV","prod"),
-        "trading_enabled": BINANCE_ENABLED,"testnet":TESTNET,
+        "trading_enabled": BINANCE_ENABLED,
+        "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    }
+    if not _is_admin(request):
+        # ПУБЛІЧНА, БЕЗПЕЧНА ВІДПОВІДЬ
+        base["webhook_secured"] = bool(SECRET) and not ALLOW_INSECURE_WEBHOOK
+        return jsonify(base)
+
+    # ПОВНА ВІДПОВІДЬ ДЛЯ АДМІНА
+    full = {
+        **base,
+        "testnet":TESTNET,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
         "preset_symbols":PRESET_SYMBOLS,"binance_import_path":_BINANCE_IMPORT_PATH,
         "poll_sec": BRACKET_POLL_SEC, "orphan_sweep_sec": ORPHAN_SWEEP_SEC,
@@ -841,13 +859,13 @@ def healthz():
         "log_dir": LOG_DIR, "exec_log": EXEC_LOG, "report_dir": REPORT_DIR,
         "webhook_secured": bool(SECRET),
         "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK,
-        "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-    })
+    }
+    return jsonify(full)
 
 @app.route("/config", methods=["GET","POST"])
 def config():
     global RISK_MODE,RISK_PCT,LEVERAGE
-    # ---- GET: тепер під токен ----
+    # ---- GET: під токен ----
     if request.method=="GET":
         if not ADMIN_TOKEN:
             return jsonify({"status":"error","msg":"admin token not set"}), 401
@@ -864,7 +882,7 @@ def config():
             "webhook_secured": bool(SECRET),
             "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK
         })
-    # ---- POST: без змін, під токен ----
+    # ---- POST: під токен ----
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","")!=ADMIN_TOKEN:
         return jsonify({"status":"error","msg":"unauthorized"}),401
     data=request.get_json(force=True,silent=True) or {}
@@ -887,12 +905,12 @@ def config():
     techlog({"level":"info","msg":"config_updated","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
     return jsonify({"status":"ok","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
 
-# ---- Нове: публічний, «безпечний» ендпойнт з мінімальною інформацією ----
+# ---- Публічний «мінімальний» конфіг ----
 @app.route("/config/public", methods=["GET"])
 def config_public():
     return jsonify({
         "status":"ok",
-        "version":"4.2.6-config-protect",
+        "version":"4.2.7-healthz-dual",
         "env": os.environ.get("ENV","prod"),
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     })
