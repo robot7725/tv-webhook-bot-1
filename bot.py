@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, json, csv, hmac, hashlib, threading, time, re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from collections import OrderedDict, deque
 from flask import Flask, request, jsonify
@@ -15,27 +15,24 @@ LEVERAGE   = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notional
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
 
-# дефолт патерну = inside (узгоджено)
+# дефолт патерну = inside
 ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "inside").lower()
-# атомарний cancelReplace під час chase
 REPRICE_ATOMIC = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 
-# Політика: ignore | replace
 IN_POSITION_POLICY = os.environ.get("IN_POSITION_POLICY", "ignore").lower()
-
 PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","").split(",") if x.strip()]
 
 SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-# Дозвіл на небезпечний вебхук лише свідомо
+# Вмикає роботу без підпису (тимчасово дозволено вами)
 ALLOW_INSECURE_WEBHOOK = os.environ.get("ALLOW_INSECURE_WEBHOOK", "false").lower() == "true"
 
-# Анти-replay параметри
+# Анти-replay
 MAX_SIGNAL_AGE_SEC     = int(os.environ.get("MAX_SIGNAL_AGE_SEC", "90"))
 ALLOW_FUTURE_SKEW_SEC  = int(os.environ.get("ALLOW_FUTURE_SKEW_SEC", "10"))
 
-# Анти-флуд параметри
+# Анти-флуд
 MAX_WEBHOOKS_PER_MIN = int(os.environ.get("MAX_WEBHOOKS_PER_MIN", "120"))
 MIN_SEC_BETWEEN_TRADES_PER_SYMBOL = float(os.environ.get("MIN_SEC_BETWEEN_TRADES_PER_SYMBOL", "1.5"))
 
@@ -57,7 +54,6 @@ CANCEL_RETRIES   = int(os.environ.get("CANCEL_RETRIES", "3"))
 ENTRY_MODE = os.environ.get("ENTRY_MODE", "market").lower()          # market | limit | maker_chase
 POST_ONLY  = os.environ.get("POST_ONLY", "true").lower() == "true"   # для LIMIT/CHASE -> timeInForce=GTX
 
-# офсет ціни для пост-онлі (пріоритет має BPS)
 PRICE_OFFSET_TICKS = int(os.environ.get("PRICE_OFFSET_TICKS", "0"))
 PRICE_OFFSET_BPS   = float(os.environ.get("PRICE_OFFSET_BPS", "0"))
 
@@ -65,10 +61,10 @@ PRICE_OFFSET_BPS   = float(os.environ.get("PRICE_OFFSET_BPS", "0"))
 CHASE_INTERVAL_MS  = int(os.environ.get("CHASE_INTERVAL_MS", "400"))
 CHASE_STEPS        = int(os.environ.get("CHASE_STEPS", "10"))
 MAX_WAIT_SEC       = float(os.environ.get("MAX_WAIT_SEC", "3"))
-MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))  # дозволений відрив до фолбеку
+MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))
 FALLBACK = os.environ.get("FALLBACK", "market").lower()               # none | market | limit_ioc
 
-# ====== Звіти (CSV only, без пошти) ======
+# ====== Звіти ======
 REPORT_DIR = os.path.join(LOG_DIR, "reports")
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
@@ -76,6 +72,14 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 CSV_PATH  = os.path.join(LOG_DIR, LOG_FILE)
 TECH_PATH = os.path.join(LOG_DIR, TECH_LOG)
 EXEC_PATH = os.path.join(LOG_DIR, EXEC_LOG)
+
+# SMTP із ENV
+SMTP_HOST  = os.environ.get("SMTP_HOST", "")
+SMTP_PORT  = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USER  = os.environ.get("SMTP_USER", "")
+SMTP_PASS  = os.environ.get("SMTP_PASS", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
+EMAIL_TO   = os.environ.get("EMAIL_TO", "")
 
 # ====== BINANCE CLIENT ======
 UMFutures = None
@@ -104,13 +108,12 @@ app = Flask(__name__)
 
 # ====== STATE ======
 DEDUP = OrderedDict()
-# BRACKETS[symbol] = { id, side, tp_id, sl_id, open_order_id, ts }
 BRACKETS = {}
 BR_LOCK = threading.RLock()
 
 # Anti-flood state
-WEBHOOK_TIMESTAMPS = deque(maxlen=10000)  # глобальні мітки часу останніх запитів
-LAST_SYMBOL_ACCEPT = {}                   # symbol -> last accept timestamp
+WEBHOOK_TIMESTAMPS = deque(maxlen=10000)
+LAST_SYMBOL_ACCEPT = {}
 RL_LOCK = threading.RLock()
 
 # ====== ROTATION (safe) ======
@@ -396,7 +399,7 @@ def _cancel_exits_for_symbol(symbol, reason):
     for od in exits:
         _cancel_order_silent(symbol, int(od.get("orderId",0)), reason)
 
-def _close_position_reduce_only(symbol, signal_id, reason="replace_close", wait_sec=5.0):
+def _close_position_reduce_only(symbol, signal_id, reason="replace", wait_sec=5.0):
     signed = _position_signed_amt(symbol)
     if signed == 0.0:
         return None
@@ -418,7 +421,7 @@ def _close_position_reduce_only(symbol, signal_id, reason="replace_close", wait_
             last_order_id = int(o.get("orderId"))
             techlog({"level":"info","msg":"replace_close_market_sent","symbol":symbol,"qty":qty,"id":last_order_id})
             vwap,qtyc,feec,assetc,rpn = _fetch_trades_for_order(symbol, last_order_id)
-            exec_log(signal_id,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+            exec_log(signal_id,"CLOSE_MANUAL",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                      vwap,qtyc,feec,assetc,rpn,symbol,("long" if signed>0 else "short"),last_order_id)
         except Exception as e:
             techlog({"level":"warn","msg":"replace_close_market_failed","symbol":symbol,"err":str(e)})
@@ -467,7 +470,7 @@ def _bracket_monitor():
                     st=_get_order_status(symbol, tp_id)
                     if st=="FILLED":
                         vwap,qty,fee,asset,rpn=_fetch_trades_for_order(symbol, tp_id)
-                        exec_log(sid,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                        exec_log(sid,"CLOSE_TP",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                                  vwap,qty,fee,asset,rpn,symbol,side,tp_id)
                         _cancel_order_silent(symbol, sl_id, "tp_filled")
                         with BR_LOCK: BRACKETS.pop(symbol,None)
@@ -476,7 +479,7 @@ def _bracket_monitor():
                     st=_get_order_status(symbol, sl_id)
                     if st=="FILLED":
                         vwap,qty,fee,asset,rpn=_fetch_trades_for_order(symbol, sl_id)
-                        exec_log(sid,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                        exec_log(sid,"CLOSE_SL",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                                  vwap,qty,fee,asset,rpn,symbol,side,sl_id)
                         _cancel_order_silent(symbol, tp_id, "sl_filled")
                         with BR_LOCK: BRACKETS.pop(symbol,None)
@@ -784,11 +787,16 @@ def dedup_seen(key:str)->bool:
     if len(DEDUP)>MAX_KEYS: DEDUP.popitem(last=False)
     return False
 
-# ====== REPORT ENDPOINT (CSV only) ======
+# ====== REPORT ENDPOINT (з поштою) ======
 try:
     import daily_report as DR
 except Exception:
     DR = None
+
+try:
+    from send_mail import send_file as send_mail_file
+except Exception:
+    send_mail_file = None
 
 from zoneinfo import ZoneInfo
 KYIV = ZoneInfo("Europe/Kyiv")
@@ -799,16 +807,29 @@ def report_daily():
         return jsonify({"status":"error","msg":"unauthorized"}), 401
     if DR is None:
         return jsonify({"status":"error","msg":"daily_report module not found"}), 500
+
     day = request.args.get("day") or datetime.now(KYIV).strftime("%Y-%m-%d")
     signals_glob = os.path.join(LOG_DIR, "*.csv")
     execs_path   = os.path.join(LOG_DIR, EXEC_LOG)
+
     try:
         signals = DR.load_signals(signals_glob)
         execs   = DR.load_execs(execs_path)
         daily   = DR.build_daily(signals, execs, day)
         out_path = os.path.join(REPORT_DIR, f"daily_trades_{day}.csv")
         daily.to_csv(out_path, index=False)
-        return jsonify({"status":"ok","rows":int(daily.shape[0]),"file":out_path,"email_sent":False})
+
+        sent = False
+        if daily.shape[0] > 0 and send_mail_file and EMAIL_TO and SMTP_HOST and SMTP_USER and SMTP_PASS:
+            try:
+                from pathlib import Path
+                subj = f"Daily CSV — {day}"
+                send_mail_file(Path(out_path), subj)
+                sent = True
+            except Exception as e:
+                techlog({"level":"warn","msg":"email_failed","err":str(e)})
+
+        return jsonify({"status":"ok","rows":int(daily.shape[0]),"file":out_path,"email_sent":sent})
     except Exception as e:
         techlog({"level":"error","msg":"report_daily_failed","err":str(e)})
         return jsonify({"status":"error","msg":str(e)}), 500
@@ -839,16 +860,10 @@ def _is_admin(req) -> bool:
 def _rate_limit_check(symbol: str) -> tuple[bool, str]:
     now = time.time()
     with RL_LOCK:
-        # purge старі глобальні таймстемпи
-        if WEBHOOK_TIMESTAMPS:
-            while WEBHOOK_TIMESTAMPS and (now - WEBHOOK_TIMESTAMPS[0] > 60.0):
-                WEBHOOK_TIMESTAMPS.popleft()
-
-        # глобальний ліміт
+        while WEBHOOK_TIMESTAMPS and (now - WEBHOOK_TIMESTAMPS[0] > 60.0):
+            WEBHOOK_TIMESTAMPS.popleft()
         if MAX_WEBHOOKS_PER_MIN > 0 and len(WEBHOOK_TIMESTAMPS) >= MAX_WEBHOOKS_PER_MIN:
             return False, f"global rate limit exceeded: {len(WEBHOOK_TIMESTAMPS)}/{MAX_WEBHOOKS_PER_MIN} in last 60s"
-
-        # ліміт по символу
         if MIN_SEC_BETWEEN_TRADES_PER_SYMBOL > 0:
             last = LAST_SYMBOL_ACCEPT.get(symbol)
             if last is not None:
@@ -856,8 +871,6 @@ def _rate_limit_check(symbol: str) -> tuple[bool, str]:
                 if dt < MIN_SEC_BETWEEN_TRADES_PER_SYMBOL:
                     wait = max(0.0, MIN_SEC_BETWEEN_TRADES_PER_SYMBOL - dt)
                     return False, f"symbol rate limit: wait {wait:.2f}s"
-
-        # якщо все ок — реєструємо споживання квоти
         WEBHOOK_TIMESTAMPS.append(now)
         LAST_SYMBOL_ACCEPT[symbol] = now
         return True, ""
@@ -870,7 +883,7 @@ def root(): return "Bot is live", 200
 def healthz():
     base = {
         "status":"ok",
-        "version":"4.2.9-rate-limit",
+        "version":"4.4.0-mail-events",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -878,7 +891,6 @@ def healthz():
     if not _is_admin(request):
         base["webhook_secured"] = bool(SECRET) and not ALLOW_INSECURE_WEBHOOK
         return jsonify(base)
-
     full = {
         **base,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
@@ -889,8 +901,7 @@ def healthz():
         "offset_ticks": PRICE_OFFSET_TICKS, "offset_bps": PRICE_OFFSET_BPS,
         "chase_ms": CHASE_INTERVAL_MS, "chase_steps": CHASE_STEPS,
         "max_wait_sec": MAX_WAIT_SEC, "max_dev_bps": MAX_DEVIATION_BPS,
-        "fallback": FALLBACK,
-        "reprice_atomic": REPRICE_ATOMIC,
+        "fallback": FALLBACK, "reprice_atomic": REPRICE_ATOMIC,
         "in_position_policy": IN_POSITION_POLICY,
         "log_dir": LOG_DIR, "exec_log": EXEC_LOG, "report_dir": REPORT_DIR,
         "webhook_secured": bool(SECRET),
@@ -899,6 +910,7 @@ def healthz():
         "allow_future_skew_sec": ALLOW_FUTURE_SKEW_SEC,
         "max_webhooks_per_min": MAX_WEBHOOKS_PER_MIN,
         "min_sec_between_trades_per_symbol": MIN_SEC_BETWEEN_TRADES_PER_SYMBOL,
+        "smtp_host": bool(SMTP_HOST), "email_to_set": bool(EMAIL_TO)
     }
     return jsonify(full)
 
@@ -947,12 +959,11 @@ def config():
     techlog({"level":"info","msg":"config_updated","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
     return jsonify({"status":"ok","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
 
-# ---- Публічний «мінімальний» конфіг ----
 @app.route("/config/public", methods=["GET"])
 def config_public():
     return jsonify({
         "status":"ok",
-        "version":"4.2.9-rate-limit",
+        "version":"4.4.0-mail-events",
         "env": os.environ.get("ENV","prod"),
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     })
@@ -1008,7 +1019,6 @@ def webhook():
         techlog({"level":"warn","msg":"bad_payload","detail":info,"data":data})
         return jsonify({"status":"error","msg":info}),400
 
-    # Свіжість сигналу
     fresh_ok, fresh_msg = _check_signal_freshness(data["time"])
     if not fresh_ok:
         techlog({"level":"warn","msg":"stale_or_future_signal","detail":fresh_msg,"raw_time":str(data["time"])})
@@ -1017,7 +1027,6 @@ def webhook():
     symbol_tv=str(data["symbol"]); symbol=tv_to_binance_symbol(symbol_tv)
     side=str(data["side"]).lower(); pattern=str(data["pattern"]).lower()
 
-    # Анти-флуд
     rl_ok, rl_msg = _rate_limit_check(symbol)
     if not rl_ok:
         techlog({"level":"warn","msg":"rate_limit","type":("global" if "global" in rl_msg else "symbol"),
@@ -1055,8 +1064,8 @@ def webhook():
 
     if BINANCE_ENABLED and BINANCE:
         try:
-            place_orders_oneway(symbol, side, info["entry"], info["tp"], info["sl"], sig_id)
-            techlog({"level":"info","msg":"trade_ok","id":sig_id,"symbol":symbol})
+            res = place_orders_oneway(symbol, side, info["entry"], info["tp"], info["sl"], sig_id)
+            techlog({"level":"info","msg":"trade_ok","id":sig_id,"symbol":symbol,"res":res})
         except Exception as e:
             techlog({"level":"error","msg":"trade_failed","id":sig_id,"err":str(e)})
     else:
@@ -1089,13 +1098,16 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
     tp_r = p_floor_to_tick(float(tp), tick)
     sl_r = p_floor_to_tick(float(sl), tick)
 
+    open_event = "OPEN_MARKET"
     # ===== Вхід =====
     if ENTRY_MODE == "market":
         open_id = _entry_market(symbol, side, qty)
+        open_event = "OPEN_MARKET"
     elif ENTRY_MODE == "limit":
         px = _offset_price_from_book(symbol, side, tick)
         tif = "GTX" if POST_ONLY else "GTC"
         open_id = _entry_limit(symbol, side, qty, px, tif=tif)
+        open_event = "OPEN_LIMIT"
     else:
         open_id, filled = _entry_maker_chase(symbol, side, qty, tick, signal_id, price_ref)
         if filled <= 0.0 and FALLBACK == "none":
@@ -1105,17 +1117,24 @@ def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: flo
         pos_amt_now = _position_amt(symbol)
         if pos_amt_now > 0:
             qty = pos_amt_now
+        open_event = "OPEN_MAKER_CHASE"
+        # Якщо був fallback — переіменуємо
+        if ENTRY_MODE == "maker_chase" and filled < qty:
+            if FALLBACK == "market":
+                open_event = "OPEN_FALLBACK_MARKET"
+            elif FALLBACK == "limit_ioc":
+                open_event = "OPEN_FALLBACK_LIMIT_IOC"
 
     with BR_LOCK:
         BRACKETS[symbol] = {
             "id":signal_id,"side":side,"tp_id":None,"sl_id":None,
             "open_order_id":open_id,"ts":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
         }
-    techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
+    techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id,"open_event":open_event})
 
     # Запис OPEN
     vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
-    exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+    exec_log(signal_id,open_event,datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
              vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
 
     # ===== Виходи =====
