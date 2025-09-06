@@ -2,7 +2,7 @@
 import os, json, csv, hmac, hashlib, threading, time, re
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from flask import Flask, request, jsonify
 
 # ====== CONFIG FROM ENV ======
@@ -10,28 +10,34 @@ BINANCE_ENABLED = os.environ.get("TRADING_ENABLED", "false").lower() == "true"
 
 API_KEY_MAIN    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET_MAIN = os.environ.get("BINANCE_API_SECRET", "")
-API_KEY_TEST    = os.environ.get("BINANCE_API_KEY_TEST", "")  # не використовується, лишено для сумісності ENV
-API_SECRET_TEST = os.environ.get("BINANCE_API_SECRET_TEST", "")  # не використовується
 
 LEVERAGE   = int(os.environ.get("LEVERAGE", "10"))
 RISK_MODE  = os.environ.get("RISK_MODE", "margin").lower()     # margin | notional
 RISK_PCT   = float(os.environ.get("RISK_PCT", "1.0"))
 
-ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "engulfing").lower()
-
-# прапорець атомарного cancelReplace під час chase
+# дефолт патерну = inside
+ALLOW_PATTERN = os.environ.get("ALLOW_PATTERN", "inside").lower()
 REPRICE_ATOMIC = os.environ.get("REPLACE_ON_NEW", "false").lower() == "true"
 
-# Політика поведінки при наявній позиції: ignore | replace
 IN_POSITION_POLICY = os.environ.get("IN_POSITION_POLICY", "ignore").lower()
-
 PRESET_SYMBOLS = [x.strip().upper() for x in os.environ.get("PRESET_SYMBOLS","").split(",") if x.strip()]
 
 SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
+# Вмикає роботу без підпису (тимчасово дозволено вами)
+ALLOW_INSECURE_WEBHOOK = os.environ.get("ALLOW_INSECURE_WEBHOOK", "false").lower() == "true"
+
+# Анти-replay
+MAX_SIGNAL_AGE_SEC     = int(os.environ.get("MAX_SIGNAL_AGE_SEC", "90"))
+ALLOW_FUTURE_SKEW_SEC  = int(os.environ.get("ALLOW_FUTURE_SKEW_SEC", "10"))
+
+# Анти-флуд
+MAX_WEBHOOKS_PER_MIN = int(os.environ.get("MAX_WEBHOOKS_PER_MIN", "120"))
+MIN_SEC_BETWEEN_TRADES_PER_SYMBOL = float(os.environ.get("MIN_SEC_BETWEEN_TRADES_PER_SYMBOL", "1.5"))
+
 LOG_DIR   = os.environ.get("LOG_DIR", "logs")
-LOG_FILE  = os.environ.get("LOG_FILE", "engulfing.csv")
+LOG_FILE  = os.environ.get("LOG_FILE", "inside.csv")
 TECH_LOG  = os.environ.get("TECH_LOG", "tech.jsonl")
 EXEC_LOG  = os.environ.get("EXEC_LOG", "executions.csv")
 ROTATE_BYTES = int(os.environ.get("ROTATE_BYTES", str(5*1024*1024)))
@@ -48,7 +54,6 @@ CANCEL_RETRIES   = int(os.environ.get("CANCEL_RETRIES", "3"))
 ENTRY_MODE = os.environ.get("ENTRY_MODE", "market").lower()          # market | limit | maker_chase
 POST_ONLY  = os.environ.get("POST_ONLY", "true").lower() == "true"   # для LIMIT/CHASE -> timeInForce=GTX
 
-# офсет ціни для пост-онлі (пріоритет має BPS)
 PRICE_OFFSET_TICKS = int(os.environ.get("PRICE_OFFSET_TICKS", "0"))
 PRICE_OFFSET_BPS   = float(os.environ.get("PRICE_OFFSET_BPS", "0"))
 
@@ -56,11 +61,11 @@ PRICE_OFFSET_BPS   = float(os.environ.get("PRICE_OFFSET_BPS", "0"))
 CHASE_INTERVAL_MS  = int(os.environ.get("CHASE_INTERVAL_MS", "400"))
 CHASE_STEPS        = int(os.environ.get("CHASE_STEPS", "10"))
 MAX_WAIT_SEC       = float(os.environ.get("MAX_WAIT_SEC", "3"))
-MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))  # дозволений відрив до фолбеку
+MAX_DEVIATION_BPS  = float(os.environ.get("MAX_DEVIATION_BPS", "10"))
 FALLBACK = os.environ.get("FALLBACK", "market").lower()               # none | market | limit_ioc
 
-# ====== Звіти (нове) ======
-REPORT_DIR = os.environ.get("REPORT_DIR", os.path.join(LOG_DIR, "reports"))
+# ====== Звіти ======
+REPORT_DIR = os.path.join(LOG_DIR, "reports")
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
 
@@ -68,7 +73,7 @@ CSV_PATH  = os.path.join(LOG_DIR, LOG_FILE)
 TECH_PATH = os.path.join(LOG_DIR, TECH_LOG)
 EXEC_PATH = os.path.join(LOG_DIR, EXEC_LOG)
 
-# SMTP (беремо з ENV, як у Cron-джобі)
+# SMTP із ENV
 SMTP_HOST  = os.environ.get("SMTP_HOST", "")
 SMTP_PORT  = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER  = os.environ.get("SMTP_USER", "")
@@ -103,9 +108,13 @@ app = Flask(__name__)
 
 # ====== STATE ======
 DEDUP = OrderedDict()
-# BRACKETS[symbol] = { id, side, tp_id, sl_id, open_order_id, ts }
 BRACKETS = {}
 BR_LOCK = threading.RLock()
+
+# Anti-flood state
+WEBHOOK_TIMESTAMPS = deque(maxlen=10000)
+LAST_SYMBOL_ACCEPT = {}
+RL_LOCK = threading.RLock()
 
 # ====== ROTATION (safe) ======
 def rotate_if_needed(path: str):
@@ -167,14 +176,36 @@ def to_iso8601(ts):
         return datetime.fromisoformat(s).astimezone(timezone.utc).isoformat().replace("+00:00","Z")
     except: return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
 
-def calc_sig(raw):
+def parse_iso8601_to_dt(iso_str: str) -> datetime:
+    s = iso_str
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).astimezone(timezone.utc)
+
+def calc_sig(raw: bytes) -> str:
     return hmac.new(SECRET.encode(), raw, hashlib.sha256).hexdigest() if SECRET else ""
 
+def _require_signature() -> bool:
+    if not SECRET and not ALLOW_INSECURE_WEBHOOK:
+        return True
+    if SECRET:
+        return True
+    return False
+
 def valid_sig(req):
-    if not SECRET: return True
+    if not SECRET:
+        if ALLOW_INSECURE_WEBHOOK:
+            techlog({"level":"warn","msg":"insecure_webhook_allowed"})
+            return True
+        return False
+    sig = req.headers.get("X-Signature", "")
+    if not sig:
+        return False
     try:
-        return hmac.compare_digest(req.headers.get("X-Signature",""), calc_sig(req.get_data(cache=False, as_text=False)))
-    except: return False
+        expected = calc_sig(req.get_data(cache=False, as_text=False))
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
 
 def tv_to_binance_symbol(tv_symbol: str) -> str:
     return re.sub(r"\.P$", "", str(tv_symbol)).upper()
@@ -262,36 +293,41 @@ def _position_amt(symbol)->float:
     except: pass
     return 0.0
 
-# ====== Helpers for robust order polling ======
-def _is_order_not_exist_err(err: Exception) -> bool:
-    s = str(err)
-    return ("-2013" in s and "Order does not exist" in s) or ("order does not exist" in s.lower())
+def _position_signed_amt(symbol)->float:
+    try:
+        for p in _fetch_positions(symbol):
+            if str(p.get("symbol","")).upper()==symbol.upper():
+                return float(p.get("positionAmt") or 0.0)
+    except: pass
+    return 0.0
+
+# ---- safe order getters (м'яко трактуємо -2013 як REJECTED) ----
+def _safe_get_order(symbol, order_id):
+    try:
+        return BINANCE.get_order(symbol=symbol, orderId=order_id), True
+    except Exception as e1:
+        try:
+            return BINANCE.query_order(symbol=symbol, orderId=order_id), True
+        except Exception as e2:
+            msg = f"{e1} | {e2}"
+            if "-2013" in msg or "Order does not exist" in msg:
+                techlog({"level":"info","msg":"order_not_found_tolerated",
+                         "symbol":symbol,"order_id":order_id,
+                         "reason":"order_rejected_or_not_found"})
+                return {}, False
+            techlog({"level":"warn","msg":"order_get_failed","symbol":symbol,"order_id":order_id,"err":msg})
+            return {}, False
 
 def _get_order_status(symbol, order_id:int) -> str:
-    try:
-        od = BINANCE.get_order(symbol=symbol, orderId=order_id)
-        return str(od.get("status","")).upper()
-    except Exception as e:
-        try:
-            od = BINANCE.query_order(symbol=symbol, orderId=order_id)
-            return str(od.get("status","")).upper()
-        except Exception as e2:
-            if _is_order_not_exist_err(e2):
-                # трактуємо як REJECTED/NOT_FOUND (звично для GTX, коли біржа одразу відхилила)
-                techlog({"level":"info","msg":"order_not_exist_soft","symbol":symbol,"order_id":order_id})
-                return "REJECTED"
-            raise
+    od, ok = _safe_get_order(symbol, order_id)
+    if not ok:
+        return "REJECTED"
+    return str(od.get("status","")).upper()
 
 def _get_order_exec_qty(symbol, order_id:int) -> float:
-    try:
-        od = BINANCE.get_order(symbol=symbol, orderId=order_id)
-    except Exception as e:
-        try:
-            od = BINANCE.query_order(symbol=symbol, orderId=order_id)
-        except Exception as e2:
-            if _is_order_not_exist_err(e2):
-                return 0.0
-            raise
+    od, ok = _safe_get_order(symbol, order_id)
+    if not ok:
+        return 0.0
     v = od.get("executedQty")
     try: return float(v)
     except: return 0.0
@@ -309,6 +345,19 @@ def _list_open_orders(symbol=None):
                 if symbol is not None:
                     continue
     return []
+
+def _split_open_orders(symbol):
+    orders = _list_open_orders(symbol) or []
+    entries, exits = [], []
+    for od in orders:
+        typ = str(od.get("type","")).upper()
+        ro  = str(od.get("reduceOnly","")).lower() in ("true","1","yes")
+        cp  = str(od.get("closePosition","")).lower() in ("true","1","yes")
+        if typ in ("STOP","STOP_MARKET","TAKE_PROFIT","TAKE_PROFIT_MARKET") or ro or cp:
+            exits.append(od)
+        else:
+            entries.append(od)
+    return entries, exits
 
 def _fetch_trades_for_order(symbol, order_id:int):
     try: trades = BINANCE.user_trades(symbol=symbol)
@@ -362,6 +411,52 @@ def _cancel_all_silent(symbol, reason):
             time.sleep(0.3)
     techlog({"level":"warn","msg":"cancel_all_failed","symbol":symbol,"err":err,"reason":reason})
 
+def _cancel_exits_for_symbol(symbol, reason):
+    _entries, exits = _split_open_orders(symbol)
+    for od in exits:
+        _cancel_order_silent(symbol, int(od.get("orderId",0)), reason)
+
+def _close_position_reduce_only(symbol, signal_id, reason="replace", wait_sec=5.0):
+    signed = _position_signed_amt(symbol)
+    if signed == 0.0:
+        return None
+    _cancel_exits_for_symbol(symbol, reason + "_cancel_exits")
+    side_to_close = "SELL" if signed > 0 else "BUY"
+    filt = fetch_symbol_filters(symbol); step = filt.get("stepSize") or 0.001
+    last_order_id = None
+    deadline = time.time() + max(0.5, wait_sec)
+    while True:
+        amt = abs(_position_signed_amt(symbol))
+        if amt <= 0.0:
+            break
+        qty = q_floor_to_step(amt, step)
+        if qty <= 0.0:
+            break
+        try:
+            o = BINANCE.new_order(symbol=symbol, side=side_to_close, type="MARKET",
+                                  reduceOnly="true", quantity=qty, newOrderRespType="RESULT")
+            last_order_id = int(o.get("orderId") or 0)
+            techlog({"level":"info","msg":"replace_close_market_sent","symbol":symbol,"qty":qty,"id":last_order_id})
+            vwap,qtyc,feec,assetc,rpn = _fetch_trades_for_order(symbol, last_order_id)
+            exec_log(signal_id,"CLOSE_MANUAL",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                     vwap,qtyc,feec,assetc,rpn,symbol,("long" if signed>0 else "short"),last_order_id)
+        except Exception as e:
+            techlog({"level":"warn","msg":"replace_close_market_failed","symbol":symbol,"err":str(e)})
+            break
+        t0 = time.time()
+        while time.time() - t0 < 0.6:
+            if abs(_position_signed_amt(symbol)) <= 0.0:
+                break
+            time.sleep(0.1)
+        if abs(_position_signed_amt(symbol)) <= 0.0:
+            break
+        if time.time() >= deadline:
+            techlog({"level":"warn","msg":"replace_close_timeout","symbol":symbol,"remain":_position_signed_amt(symbol)})
+            break
+    with BR_LOCK:
+        BRACKETS.pop(symbol, None)
+    return last_order_id
+
 # ====== BRACKET MONITOR ======
 def _bracket_monitor():
     while True:
@@ -373,16 +468,26 @@ def _bracket_monitor():
                 tp_id=b.get("tp_id"); sl_id=b.get("sl_id")
 
                 if _position_amt(symbol)==0.0:
-                    _cancel_all_silent(symbol, "pos_is_zero")
+                    entries, exits = _split_open_orders(symbol)
+                    if entries:
+                        techlog({"level":"debug","msg":"flat_but_entry_present","symbol":symbol,"entries":len(entries),"exits":len(exits)})
+                        continue
+                    if exits:
+                        for od in exits:
+                            oid = int(od.get("orderId", 0))
+                            _cancel_order_silent(symbol, oid, "pos_is_zero_exit_cleanup")
+                        with BR_LOCK: BRACKETS.pop(symbol, None)
+                        techlog({"level":"info","msg":"exit_orphans_cleaned_flat","symbol":symbol,"count":len(exits)})
+                        continue
                     with BR_LOCK: BRACKETS.pop(symbol, None)
-                    techlog({"level":"info","msg":"bracket_removed_on_zero_position","symbol":symbol})
+                    techlog({"level":"info","msg":"bracket_removed_flat_no_orders","symbol":symbol})
                     continue
 
                 if tp_id:
                     st=_get_order_status(symbol, tp_id)
                     if st=="FILLED":
                         vwap,qty,fee,asset,rpn=_fetch_trades_for_order(symbol, tp_id)
-                        exec_log(sid,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                        exec_log(sid,"CLOSE_TP",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                                  vwap,qty,fee,asset,rpn,symbol,side,tp_id)
                         _cancel_order_silent(symbol, sl_id, "tp_filled")
                         with BR_LOCK: BRACKETS.pop(symbol,None)
@@ -391,7 +496,7 @@ def _bracket_monitor():
                     st=_get_order_status(symbol, sl_id)
                     if st=="FILLED":
                         vwap,qty,fee,asset,rpn=_fetch_trades_for_order(symbol, sl_id)
-                        exec_log(sid,"CLOSE",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                        exec_log(sid,"CLOSE_SL",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
                                  vwap,qty,fee,asset,rpn,symbol,side,sl_id)
                         _cancel_order_silent(symbol, tp_id, "sl_filled")
                         with BR_LOCK: BRACKETS.pop(symbol,None)
@@ -410,18 +515,20 @@ def _recover_state():
                 candidates.add(str(od["symbol"]).upper())
     except:
         pass
-
     for s in sorted(candidates):
         try:
             amt = _position_amt(s)
             orders = _list_open_orders(s) or []
+            entries, exits = _split_open_orders(s)
             if amt == 0.0:
-                has_any = len(orders)>0
-                if has_any and CANCEL_ORPHANS:
-                    _cancel_all_silent(s, "recover_cleanup_orphans")
-                    techlog({"level":"info","msg":"orphans_cleaned","symbol":s})
+                if entries:
+                    techlog({"level":"info","msg":"recover_flat_keep_entries","symbol":s,"entries":len(entries),"exits":len(exits)})
+                    continue
+                if exits and CANCEL_ORPHANS:
+                    for od in exits:
+                        _cancel_order_silent(s, int(od.get("orderId",0)), "recover_cleanup_exit_orphans")
+                    techlog({"level":"info","msg":"recover_exit_orphans_cleaned","symbol":s,"count":len(exits)})
                 continue
-
             tp_id = sl_id = None
             for od in orders:
                 typ = str(od.get("type","")).upper()
@@ -432,8 +539,7 @@ def _recover_state():
                     tp_id = oid
                 if typ in ("STOP","STOP_MARKET") and (cp or ro):
                     sl_id = oid
-
-            side = "long" if any(float(p.get("positionAmt",0))>0 for p in _fetch_positions(s)) else "short"
+            side = "long" if _position_signed_amt(s) > 0 else "short"
             with BR_LOCK:
                 BRACKETS[s] = {
                     "id": f"recover|{s}|{int(time.time())}",
@@ -460,12 +566,14 @@ def _orphan_sweeper():
                     if sy: symbols.add(sy)
             except:
                 symbols.update([s for s in PRESET_SYMBOLS if s])
-
             for s in sorted(symbols):
                 try:
                     if _position_amt(s) == 0.0:
-                        if _list_open_orders(s):
-                            _cancel_all_silent(s, "orphan_sweeper")
+                        entries, exits = _split_open_orders(s)
+                        if (not entries) and exits:
+                            for od in exits:
+                                _cancel_order_silent(s, int(od.get("orderId",0)), "orphan_sweeper_exit_only")
+                            techlog({"level":"info","msg":"orphan_sweeper_exit_cleaned","symbol":s,"count":len(exits)})
                 except Exception as e:
                     techlog({"level":"warn","msg":"orphan_sweep_symbol_failed","symbol":s,"err":str(e)})
         except Exception as e:
@@ -480,12 +588,10 @@ def compute_qty(symbol, price):
     else:
         notional = bal*(RISK_PCT/100.0)
     qty_raw = notional/max(price, 1e-12)
-
     f=fetch_symbol_filters(symbol)
     step=f.get("stepSize") or 0.001
     min_qty=f.get("minQty") or 0.0
     min_not=f.get("minNotional") or 0.0
-
     qty=q_floor_to_step(qty_raw, step)
     if min_qty and qty<min_qty: qty=min_qty
     if min_not and (qty*price)<min_not:
@@ -512,15 +618,13 @@ def _offset_price_from_book(symbol, side, tick):
 # ====== EXIT ORDERS ======
 def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
     """
-    TP як TAKE_PROFIT_MARKET (closePosition=true, workingType=MARK_PRICE).
-    SL як STOP_MARKET (closePosition=true).
+    TP: TAKE_PROFIT_MARKET (closePosition=true, workingType=MARK_PRICE)
+    SL: STOP_MARKET (closePosition=true)
     """
     exit_side = "SELL" if side=="long" else "BUY"
     tp_id = sl_id = None
     filt = fetch_symbol_filters(symbol)
     tick = filt.get("tickSize") or 0.0001
-
-    # TP: TAKE_PROFIT_MARKET (closePosition)
     try:
         oTP = BINANCE.new_order(
             symbol=symbol, side=exit_side, type="TAKE_PROFIT_MARKET",
@@ -528,12 +632,10 @@ def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
             closePosition="true", workingType="MARK_PRICE",
             newOrderRespType="RESULT"
         )
-        tp_id = int(oTP.get("orderId")) if oTP.get("orderId") else None
+        tp_id = int(oTP.get("orderId") or 0)
         techlog({"level":"info","msg":"tp_take_profit_market_ok","symbol":symbol,"tp":tp_price,"tp_id":tp_id})
     except Exception as e:
         techlog({"level":"warn","msg":"tp_take_profit_market_failed","symbol":symbol,"tp":tp_price,"err":str(e)})
-
-    # SL: STOP_MARKET (closePosition)
     try:
         oSL = BINANCE.new_order(
             symbol=symbol, side=exit_side, type="STOP_MARKET",
@@ -541,11 +643,10 @@ def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
             closePosition="true", workingType="MARK_PRICE",
             newOrderRespType="RESULT"
         )
-        sl_id = int(oSL.get("orderId")) if oSL.get("orderId") else None
+        sl_id = int(oSL.get("orderId") or 0)
         techlog({"level":"info","msg":"sl_stop_market_ok","symbol":symbol,"sl":sl_price,"sl_id":sl_id})
     except Exception as e:
         techlog({"level":"warn","msg":"sl_stop_market_failed","symbol":symbol,"sl":sl_price,"err":str(e)})
-
     with BR_LOCK:
         BRACKETS[symbol] = {
             "id":signal_id,"side":side,"tp_id":tp_id,"sl_id":sl_id,
@@ -558,8 +659,9 @@ def _place_exits(symbol, side, qty, tp_price, sl_price, signal_id):
 # ====== ENTRY HELPERS ======
 def _entry_market(symbol, side, qty):
     open_side="BUY" if side=="long" else "SELL"
-    o_open=BINANCE.new_order(symbol=symbol, side=open_side, type="MARKET", quantity=qty, newOrderRespType="RESULT")
-    return int(o_open.get("orderId"))
+    o_open=BINANCE.new_order(symbol=symbol, side=open_side, type="MARKET",
+                             quantity=qty, newOrderRespType="RESULT")
+    return int(o_open.get("orderId") or 0)
 
 def _entry_limit(symbol, side, qty, price, tif="GTC"):
     filt = fetch_symbol_filters(symbol)
@@ -571,10 +673,16 @@ def _entry_limit(symbol, side, qty, price, tif="GTC"):
     o = BINANCE.new_order(symbol=symbol, side=open_side, type="LIMIT",
                           price=price, quantity=qty, timeInForce=tif,
                           newOrderRespType="RESULT")
-    return int(o.get("orderId"))
+    status = str(o.get("status","")).upper()
+    oid = int(o.get("orderId") or 0)
+    if status in ("REJECTED","EXPIRED","CANCELED") or oid == 0:
+        techlog({"level":"info","msg":"entry_seed_rejected",
+                 "symbol":symbol,"side":side,"qty":qty,"price":price,"tif":tif,"status":status})
+        return 0
+    return oid
 
 def _status_is_open(status: str) -> bool:
-    return status in ("NEW","PARTIALLY_FILLED","PENDING_NEW","ACCEPTED")
+    return status in ("NEW","PARTIALLY_FILLED","PENDING_NEW")
 
 def _within_deviation(entry_ref, side, max_bps):
     bid, ask = get_best_bid_ask(entry_ref["symbol"])
@@ -589,7 +697,6 @@ def _within_deviation(entry_ref, side, max_bps):
 def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
     new_price = _offset_price_from_book(symbol, side, tick)
     open_side = "BUY" if side=="long" else "SELL"
-
     if REPRICE_ATOMIC:
         for m in ("cancel_replace", "cancel_replace_order", "cancelReplace"):
             if hasattr(BINANCE, m):
@@ -622,7 +729,8 @@ def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
                 except Exception as e:
                     techlog({"level":"warn","msg":"entry_reprice_atomic_failed","symbol":symbol,"err":str(e)})
                     break
-    _cancel_order_silent(symbol, old_order_id, "chase_reprice")
+    if old_order_id:
+        _cancel_order_silent(symbol, old_order_id, "chase_reprice")
     new_id = _entry_limit(symbol, side, remain_qty, new_price, tif=tif)
     techlog({"level":"info","msg":"entry_repriced","symbol":symbol,"price":new_price,"remain":remain_qty,"id":new_id})
     return new_id, False
@@ -630,38 +738,43 @@ def _try_cancel_replace(symbol, side, old_order_id, remain_qty, tif, tick):
 def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
     tif = "GTX" if POST_ONLY else "GTC"
     price = _offset_price_from_book(symbol, side, tick)
-
-    # seed з RESULT, без негайного get_order
     order_id = _entry_limit(symbol, side, qty, price, tif=tif)
     techlog({"level":"info","msg":"entry_limit_seeded","symbol":symbol,"side":side,"qty":qty,"price":price,"tif":tif,"id":order_id})
 
     start = time.time()
     filled_qty = 0.0
     steps_done = 0
+
     while True:
         time.sleep(max(0.05, CHASE_INTERVAL_MS/1000.0))
         steps_done += 1
 
-        # м’яко читаємо статус
-        st = _get_order_status(symbol, order_id)
-        if st == "REJECTED":
-            # типовий кейс для GTX — одразу робимо reprice
-            try:
-                order_id, _ = _try_cancel_replace(symbol, side, order_id, qty - filled_qty, tif, tick)
-                continue
-            except Exception as e:
-                techlog({"level":"warn","msg":"entry_reprice_on_reject_failed","err":str(e)})
-                break
+        # Якщо seed одразу відхилився (GTX), не намагаємось читати get_order
+        if order_id == 0:
+            techlog({"level":"info","msg":"seed_rejected_retry",
+                     "symbol":symbol,"reason":"order_rejected_or_not_found","mode":tif})
+            remain = max(0.0, qty - filled_qty)
+            order_id, _ = _try_cancel_replace(symbol, side, 0, remain, tif, tick)
+            continue
 
-        eq = _get_order_exec_qty(symbol, order_id) if st in ("PARTIALLY_FILLED","FILLED","NEW","PENDING_NEW","ACCEPTED") else 0.0
+        st = _get_order_status(symbol, order_id)
+        if st in ("REJECTED","CANCELED","EXPIRED"):
+            techlog({"level":"info","msg":"entry_status_rejected_retry",
+                     "symbol":symbol,"order_id":order_id,"status":st,"mode":tif,
+                     "reason":"order_rejected_or_not_found"})
+            remain = max(0.0, qty - filled_qty)
+            order_id, _ = _try_cancel_replace(symbol, side, order_id, remain, tif, tick)
+            continue
+
+        eq = _get_order_exec_qty(symbol, order_id) if st in ("PARTIALLY_FILLED","FILLED") else 0.0
         filled_qty = max(filled_qty, eq or 0.0)
 
         if st=="FILLED":
             techlog({"level":"info","msg":"entry_filled","symbol":symbol,"id":order_id,"filled":filled_qty,"steps":steps_done})
             return order_id, filled_qty
 
-        if time.time()-start >= MAX_WAIT_SEC or steps_done >= CHASE_STEPS or not _within_deviation(
-            {"symbol":symbol,"ref_price":ref_price}, side, MAX_DEVIATION_BPS):
+        if (time.time()-start >= MAX_WAIT_SEC) or (steps_done >= CHASE_STEPS) or (not _within_deviation(
+            {"symbol":symbol,"ref_price":ref_price}, side, MAX_DEVIATION_BPS)):
             break
 
         remain = max(0.0, qty - (filled_qty or 0.0))
@@ -677,7 +790,6 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
     if remain > 0:
         try: _cancel_order_silent(symbol, order_id, "fallback")
         except: pass
-
     if FALLBACK == "market" and remain > 0:
         fb_id = _entry_market(symbol, side, remain)
         techlog({"level":"info","msg":"fallback_market_done","symbol":symbol,"remain":remain,"id":fb_id})
@@ -687,7 +799,7 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
         fb_price = _offset_price_from_book(symbol, side, tick)
         fb = BINANCE.new_order(symbol=symbol, side=("BUY" if side=="long" else "SELL"), type="LIMIT",
                                price=fb_price, quantity=remain, timeInForce=tif, newOrderRespType="RESULT")
-        fb_id = int(fb.get("orderId"))
+        fb_id = int(fb.get("orderId") or 0)
         time.sleep(0.2)
         eq = _get_order_exec_qty(symbol, fb_id)
         techlog({"level":"info","msg":"fallback_limit_ioc_done","symbol":symbol,"filled_ioc":eq,"remain_req":remain,"id":fb_id})
@@ -696,80 +808,30 @@ def _entry_maker_chase(symbol, side, qty, tick, signal_id, ref_price):
         techlog({"level":"info","msg":"fallback_none","symbol":symbol,"filled":filled_qty,"remain":remain})
         return order_id, filled_qty
 
-def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
-    symbol=symbol.upper()
-    ensure_oneway_mode(); ensure_leverage(symbol)
-
-    with BR_LOCK: has_local = symbol in BRACKETS
-    if BINANCE and has_local and _position_amt(symbol)==0.0 and not _list_open_orders(symbol):
-        with BR_LOCK: BRACKETS.pop(symbol,None)
-        techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":signal_id}); has_local=False
-
-    pos_amt=_position_amt(symbol)
-
-    if pos_amt>0.0:
-        if IN_POSITION_POLICY=="ignore":
-            techlog({"level":"info","msg":"ignored_new_signal_active_position","id":signal_id,"symbol":symbol})
-            return {"status":"ok","msg":"ignored_active_position","id":signal_id}
-        elif IN_POSITION_POLICY=="replace":
-            try:
-                exit_side="SELL" if side=="long" else "BUY"
-                filt=fetch_symbol_filters(symbol); step=filt.get("stepSize") or 0.001
-                BINANCE.new_order(symbol=symbol, side=exit_side, type="MARKET", reduceOnly="true",
-                                  quantity=q_floor_to_step(pos_amt, step), newOrderRespType="RESULT")
-                techlog({"level":"info","msg":"replaced_old_position","symbol":symbol,"qty":pos_amt})
-            except Exception as e:
-                techlog({"level":"warn","msg":"replace_market_close_failed","symbol":symbol,"err":str(e)})
-            with BR_LOCK: BRACKETS.pop(symbol, None)
-
-    price_ref = get_mark_price(symbol)
-    qty  = compute_qty(symbol, price_ref)
-    filt = fetch_symbol_filters(symbol)
-    tick = filt.get("tickSize") or 0.0001
-
-    tp_r = p_floor_to_tick(float(tp), tick)
-    sl_r = p_floor_to_tick(float(sl), tick)
-
-    # ===== Вхід =====
-    if ENTRY_MODE == "market":
-        open_id = _entry_market(symbol, side, qty)
-        filled = qty
-    elif ENTRY_MODE == "limit":
-        px = _offset_price_from_book(symbol, side, tick)
-        tif = "GTX" if POST_ONLY else "GTC"
-        open_id = _entry_limit(symbol, side, qty, px, tif=tif)
-        filled = _get_order_exec_qty(symbol, open_id)
-    else:
-        open_id, filled = _entry_maker_chase(symbol, side, qty, tick, signal_id, price_ref)
-        if filled <= 0.0 and FALLBACK == "none":
-            techlog({"level":"info","msg":"no_entry_filled","symbol":symbol})
-            return {"skipped":True,"reason":"no_filled"}
-        time.sleep(0.2)
-        pos_amt_now = _position_amt(symbol)
-        if pos_amt_now > 0:
-            qty = pos_amt_now
-
-    with BR_LOCK:
-        BRACKETS[symbol] = {
-            "id":signal_id,"side":side,"tp_id":None,"sl_id":None,
-            "open_order_id":open_id,"ts":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-        }
-    techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id})
-
-    # Запис OPEN
-    vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
-    exec_log(signal_id,"OPEN",datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-             vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
-
-    # ===== Виходи =====
-    tp_id, sl_id = _place_exits(symbol, side, qty, tp_r, sl_r, signal_id)
-
-    return {"qty":qty,"price_ref":price_ref,"tp":tp_r,"sl":sl_r,"open_order_id":open_id,"tp_id":tp_id,"sl_id":sl_id}
-
 # ====== DEDUP ======
-def build_id(pattern, side, time_raw, entry_val):
-    entry_str = "{:.10f}".format(float(entry_val))
-    return f"{pattern}|{side}|{str(time_raw).lower()}|{entry_str}"
+def _format_price_for_key(val: float, tick: float|None) -> str:
+    try:
+        v = float(val)
+    except:
+        return "nan"
+    if tick and tick > 0:
+        v = p_floor_to_tick(v, tick)
+    return "{:.10f}".format(v)
+
+def build_id(symbol: str, pattern: str, side: str, time_raw, entry_val, tp_val, sl_val):
+    sym = str(symbol).upper()
+    t_iso = to_iso8601(time_raw)
+    tick = None
+    try:
+        if BINANCE:
+            filt = fetch_symbol_filters(sym)
+            tick = float(filt.get("tickSize") or 0.0)
+    except:
+        tick = None
+    e_str  = _format_price_for_key(entry_val, tick)
+    tp_str = _format_price_for_key(tp_val, tick)
+    sl_str = _format_price_for_key(sl_val, tick)
+    return f"{sym}|{pattern}|{side}|{t_iso}|e:{e_str}|tp:{tp_str}|sl:{sl_str}"
 
 def dedup_seen(key:str)->bool:
     if key in DEDUP:
@@ -778,7 +840,7 @@ def dedup_seen(key:str)->bool:
     if len(DEDUP)>MAX_KEYS: DEDUP.popitem(last=False)
     return False
 
-# ====== REPORT ENDPOINT (нове) ======
+# ====== REPORT ENDPOINT (з поштою) ======
 try:
     import daily_report as DR
 except Exception:
@@ -811,10 +873,11 @@ def report_daily():
         daily.to_csv(out_path, index=False)
 
         sent = False
-        if daily.shape[0] > 0 and send_mail_file and EMAIL_TO:
+        if daily.shape[0] > 0 and send_mail_file and EMAIL_TO and SMTP_HOST and SMTP_USER and SMTP_PASS:
             try:
                 from pathlib import Path
-                send_mail_file(Path(out_path), f"Daily CSV — {day}")
+                subj = f"Daily CSV — {day}"
+                send_mail_file(Path(out_path), subj)
                 sent = True
             except Exception as e:
                 techlog({"level":"warn","msg":"email_failed","err":str(e)})
@@ -827,14 +890,12 @@ def report_daily():
 # ====== INIT BINANCE & WORKERS ======
 if BINANCE_ENABLED and UMFutures:
     try:
-        # тільки прод
         BINANCE = UMFutures(key=API_KEY_MAIN, secret=API_SECRET_MAIN)
-        techlog({"level":"info","msg":"binance_client_ready","import_path":_BINANCE_IMPORT_PATH,"testnet":False})
+        techlog({"level":"info","msg":"binance_client_ready","import_path":_BINANCE_IMPORT_PATH})
         ensure_oneway_mode()
         for s in PRESET_SYMBOLS:
             try: BINANCE.change_leverage(symbol=s, leverage=LEVERAGE); LEVERAGE_SET.add(s)
             except Exception as e: techlog({"level":"warn","msg":"preset_leverage_failed","symbol":s,"err":str(e)})
-
         _recover_state()
         threading.Thread(target=_bracket_monitor, daemon=True).start()
         threading.Thread(target=_orphan_sweeper, daemon=True).start()
@@ -843,16 +904,48 @@ if BINANCE_ENABLED and UMFutures:
         techlog({"level":"warn","msg":"binance_client_init_failed","err":str(e)})
         BINANCE_ENABLED=False; BINANCE=None
 
+# ====== HELPERS ======
+def _is_admin(req) -> bool:
+    if not ADMIN_TOKEN:
+        return False
+    return req.headers.get("X-Admin-Token","") == ADMIN_TOKEN
+
+def _rate_limit_check(symbol: str) -> tuple[bool, str]:
+    now = time.time()
+    with RL_LOCK:
+        while WEBHOOK_TIMESTAMPS and (now - WEBHOOK_TIMESTAMPS[0] > 60.0):
+            WEBHOOK_TIMESTAMPS.popleft()
+        if MAX_WEBHOOKS_PER_MIN > 0 and len(WEBHOOK_TIMESTAMPS) >= MAX_WEBHOOKS_PER_MIN:
+            return False, f"global rate limit exceeded: {len(WEBHOOK_TIMESTAMPS)}/{MAX_WEBHOOKS_PER_MIN} in last 60s"
+        if MIN_SEC_BETWEEN_TRADES_PER_SYMBOL > 0:
+            last = LAST_SYMBOL_ACCEPT.get(symbol)
+            if last is not None:
+                dt = now - last
+                if dt < MIN_SEC_BETWEEN_TRADES_PER_SYMBOL:
+                    wait = max(0.0, MIN_SEC_BETWEEN_TRADES_PER_SYMBOL - dt)
+                    return False, f"symbol rate limit: wait {wait:.2f}s"
+        WEBHOOK_TIMESTAMPS.append(now)
+        LAST_SYMBOL_ACCEPT[symbol] = now
+        return True, ""
+
 # ====== ROUTES ======
 @app.route("/")
 def root(): return "Bot is live", 200
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({
-        "status":"ok","version":"4.5.0-maker-chase-resilient",
+    base = {
+        "status":"ok",
+        "version":"4.4.0-mail-events",
         "env": os.environ.get("ENV","prod"),
         "trading_enabled": BINANCE_ENABLED,
+        "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    }
+    if not _is_admin(request):
+        base["webhook_secured"] = bool(SECRET) and not ALLOW_INSECURE_WEBHOOK
+        return jsonify(base)
+    full = {
+        **base,
         "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
         "preset_symbols":PRESET_SYMBOLS,"binance_import_path":_BINANCE_IMPORT_PATH,
         "poll_sec": BRACKET_POLL_SEC, "orphan_sweep_sec": ORPHAN_SWEEP_SEC,
@@ -861,24 +954,42 @@ def healthz():
         "offset_ticks": PRICE_OFFSET_TICKS, "offset_bps": PRICE_OFFSET_BPS,
         "chase_ms": CHASE_INTERVAL_MS, "chase_steps": CHASE_STEPS,
         "max_wait_sec": MAX_WAIT_SEC, "max_dev_bps": MAX_DEVIATION_BPS,
-        "fallback": FALLBACK,
-        "reprice_atomic": REPRICE_ATOMIC,
+        "fallback": FALLBACK, "reprice_atomic": REPRICE_ATOMIC,
         "in_position_policy": IN_POSITION_POLICY,
         "log_dir": LOG_DIR, "exec_log": EXEC_LOG, "report_dir": REPORT_DIR,
-        "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-    })
+        "webhook_secured": bool(SECRET),
+        "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK,
+        "max_signal_age_sec": MAX_SIGNAL_AGE_SEC,
+        "allow_future_skew_sec": ALLOW_FUTURE_SKEW_SEC,
+        "max_webhooks_per_min": MAX_WEBHOOKS_PER_MIN,
+        "min_sec_between_trades_per_symbol": MIN_SEC_BETWEEN_TRADES_PER_SYMBOL,
+        "smtp_host": bool(SMTP_HOST), "email_to_set": bool(EMAIL_TO)
+    }
+    return jsonify(full)
 
 @app.route("/config", methods=["GET","POST"])
 def config():
     global RISK_MODE,RISK_PCT,LEVERAGE
     if request.method=="GET":
-        return jsonify({"risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
-                        "allow_pattern":ALLOW_PATTERN,"trading_enabled":BINANCE_ENABLED,
-                        "reprice_atomic":REPRICE_ATOMIC,"in_position_policy":IN_POSITION_POLICY,
-                        "entry_mode":ENTRY_MODE,"post_only":POST_ONLY,
-                        "offset_ticks":PRICE_OFFSET_TICKS,"offset_bps":PRICE_OFFSET_BPS,
-                        "chase_ms":CHASE_INTERVAL_MS,"chase_steps":CHASE_STEPS,
-                        "max_wait_sec":MAX_WAIT_SEC,"max_dev_bps":MAX_DEVIATION_BPS,"fallback":FALLBACK})
+        if not ADMIN_TOKEN:
+            return jsonify({"status":"error","msg":"admin token not set"}), 401
+        if request.headers.get("X-Admin-Token","") != ADMIN_TOKEN:
+            return jsonify({"status":"error","msg":"unauthorized"}), 401
+        return jsonify({
+            "risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE,
+            "allow_pattern":ALLOW_PATTERN,"trading_enabled":BINANCE_ENABLED,
+            "reprice_atomic":REPRICE_ATOMIC,"in_position_policy":IN_POSITION_POLICY,
+            "entry_mode":ENTRY_MODE,"post_only":POST_ONLY,
+            "offset_ticks":PRICE_OFFSET_TICKS,"offset_bps":PRICE_OFFSET_BPS,
+            "chase_ms":CHASE_INTERVAL_MS,"chase_steps":CHASE_STEPS,
+            "max_wait_sec":MAX_WAIT_SEC,"max_dev_bps":MAX_DEVIATION_BPS,"fallback":FALLBACK,
+            "webhook_secured": bool(SECRET),
+            "allow_insecure_webhook": ALLOW_INSECURE_WEBHOOK,
+            "max_signal_age_sec": MAX_SIGNAL_AGE_SEC,
+            "allow_future_skew_sec": ALLOW_FUTURE_SKEW_SEC,
+            "max_webhooks_per_min": MAX_WEBHOOKS_PER_MIN,
+            "min_sec_between_trades_per_symbol": MIN_SEC_BETWEEN_TRADES_PER_SYMBOL
+        })
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token","")!=ADMIN_TOKEN:
         return jsonify({"status":"error","msg":"unauthorized"}),401
     data=request.get_json(force=True,silent=True) or {}
@@ -901,6 +1012,15 @@ def config():
     techlog({"level":"info","msg":"config_updated","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
     return jsonify({"status":"ok","risk_mode":RISK_MODE,"risk_pct":RISK_PCT,"leverage":LEVERAGE})
 
+@app.route("/config/public", methods=["GET"])
+def config_public():
+    return jsonify({
+        "status":"ok",
+        "version":"4.4.0-mail-events",
+        "env": os.environ.get("ENV","prod"),
+        "time": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    })
+
 def validate_payload(d:dict):
     req = ["signal","symbol","time","side","pattern","entry","tp","sl"]
     miss=[k for k in req if k not in d]
@@ -912,21 +1032,65 @@ def validate_payload(d:dict):
     if e is None or t is None or s is None: return False, "entry/tp/sl must be numeric"
     return True, {"entry":e,"tp":t,"sl":s}
 
+def _check_signal_freshness(raw_time_value) -> tuple[bool, str]:
+    try:
+        t_iso = to_iso8601(raw_time_value)
+        t_dt  = parse_iso8601_to_dt(t_iso)
+        now   = datetime.now(timezone.utc)
+        diff  = now - t_dt
+        if diff.total_seconds() > MAX_SIGNAL_AGE_SEC:
+            return False, f"signal too old: age_sec={int(diff.total_seconds())}, max={MAX_SIGNAL_AGE_SEC}"
+        if diff.total_seconds() < 0:
+            fut = -diff.total_seconds()
+            if fut > ALLOW_FUTURE_SKEW_SEC:
+                return False, f"signal time too far in future: skew_sec={int(fut)}, max={ALLOW_FUTURE_SKEW_SEC}"
+        return True, ""
+    except Exception as e:
+        return False, f"bad time format: {str(e)}"
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if not valid_sig(request):
-        techlog({"level":"warn","msg":"bad_signature"}); return jsonify({"status":"error","msg":"bad signature"}),401
-    try: data=request.get_json(force=True, silent=False)
+    if _require_signature() and not SECRET:
+        techlog({"level":"warn","msg":"webhook_secret_missing"})
+        return jsonify({"status":"error","msg":"webhook secret not set"}), 401
+    if SECRET:
+        sig_hdr = request.headers.get("X-Signature", "")
+        if not sig_hdr:
+            techlog({"level":"warn","msg":"missing_signature_header"})
+            return jsonify({"status":"error","msg":"missing signature"}), 401
+        if not valid_sig(request):
+            techlog({"level":"warn","msg":"bad_signature"})
+            return jsonify({"status":"error","msg":"bad signature"}), 401
+    try:
+        data=request.get_json(force=True, silent=False)
     except Exception as e:
-        techlog({"level":"error","msg":"bad_json","err":str(e)}); return jsonify({"status":"error","msg":"bad json"}),400
+        techlog({"level":"error","msg":"bad_json","err":str(e)})
+        return jsonify({"status":"error","msg":"bad json"}),400
 
     ok, info = validate_payload(data)
     if not ok:
-        techlog({"level":"warn","msg":"bad_payload","detail":info,"data":data}); return jsonify({"status":"error","msg":info}),400
+        techlog({"level":"warn","msg":"bad_payload","detail":info,"data":data})
+        return jsonify({"status":"error","msg":info}),400
+
+    fresh_ok, fresh_msg = _check_signal_freshness(data["time"])
+    if not fresh_ok:
+        techlog({"level":"warn","msg":"stale_or_future_signal","detail":fresh_msg,"raw_time":str(data["time"])})
+        return jsonify({"status":"error","msg":fresh_msg}), 400
 
     symbol_tv=str(data["symbol"]); symbol=tv_to_binance_symbol(symbol_tv)
     side=str(data["side"]).lower(); pattern=str(data["pattern"]).lower()
-    sig_id=build_id(pattern, side, str(data["time"]), float(info["entry"]))
+
+    rl_ok, rl_msg = _rate_limit_check(symbol)
+    if not rl_ok:
+        techlog({"level":"warn","msg":"rate_limit","type":("global" if "global" in rl_msg else "symbol"),
+                 "symbol":symbol,"detail":rl_msg})
+        return jsonify({"status":"error","msg":rl_msg}), 429
+
+    ext_id = str(data.get("id") or data.get("signal_id") or "").strip()
+    if ext_id:
+        sig_id = f"ext|{ext_id}"
+    else:
+        sig_id = build_id(symbol, pattern, side, data["time"], info["entry"], info["tp"], info["sl"])
 
     print("[WEBHOOK_OK] id={} data={}".format(sig_id, json.dumps(data, ensure_ascii=False)), flush=True)
 
@@ -940,7 +1104,8 @@ def webhook():
         return jsonify({"status":"ok","msg":"ignored_active_position","id":sig_id})
 
     if dedup_seen(sig_id):
-        techlog({"level":"info","msg":"duplicate_ignored","id":sig_id}); return jsonify({"status":"ok","msg":"ignored","id":sig_id})
+        techlog({"level":"info","msg":"duplicate_ignored","id":sig_id})
+        return jsonify({"status":"ok","msg":"ignored","id":sig_id})
 
     rotate_if_needed(CSV_PATH)
     newfile=not os.path.exists(CSV_PATH)
@@ -952,14 +1117,82 @@ def webhook():
 
     if BINANCE_ENABLED and BINANCE:
         try:
-            place_orders_oneway(symbol, side, info["entry"], info["tp"], info["sl"], sig_id)
-            techlog({"level":"info","msg":"trade_ok","id":sig_id,"symbol":symbol})
+            res = place_orders_oneway(symbol, side, info["entry"], info["tp"], info["sl"], sig_id)
+            techlog({"level":"info","msg":"trade_ok","id":sig_id,"symbol":symbol,"res":res})
         except Exception as e:
             techlog({"level":"error","msg":"trade_failed","id":sig_id,"err":str(e)})
     else:
         techlog({"level":"info","msg":"trading_disabled","id":sig_id})
 
     return jsonify({"status":"ok","msg":"logged","id":sig_id})
+
+def place_orders_oneway(symbol: str, side: str, entry: float, tp: float, sl: float, signal_id: str):
+    symbol=symbol.upper()
+    ensure_oneway_mode(); ensure_leverage(symbol)
+
+    with BR_LOCK: has_local = symbol in BRACKETS
+    if BINANCE and has_local and _position_amt(symbol)==0.0 and not _list_open_orders(symbol):
+        with BR_LOCK: BRACKETS.pop(symbol,None)
+        techlog({"level":"info","msg":"stale_bracket_purged","symbol":symbol,"id":signal_id}); has_local=False
+
+    pos_amt=_position_amt(symbol)
+    if pos_amt>0.0:
+        if IN_POSITION_POLICY=="ignore":
+            techlog({"level":"info","msg":"ignored_new_signal_active_position","id":signal_id,"symbol":symbol})
+            return {"status":"ok","msg":"ignored_active_position","id":signal_id}
+        elif IN_POSITION_POLICY=="replace":
+            _close_position_reduce_only(symbol, signal_id, reason="replace")
+
+    price_ref = get_mark_price(symbol)
+    qty  = compute_qty(symbol, price_ref)
+    filt = fetch_symbol_filters(symbol)
+    tick = filt.get("tickSize") or 0.0001
+
+    tp_r = p_floor_to_tick(float(tp), tick)
+    sl_r = p_floor_to_tick(float(sl), tick)
+
+    open_event = "OPEN_MARKET"
+    # ===== Вхід =====
+    if ENTRY_MODE == "market":
+        open_id = _entry_market(symbol, side, qty)
+        open_event = "OPEN_MARKET"
+    elif ENTRY_MODE == "limit":
+        px = _offset_price_from_book(symbol, side, tick)
+        tif = "GTX" if POST_ONLY else "GTC"
+        open_id = _entry_limit(symbol, side, qty, px, tif=tif)
+        open_event = "OPEN_LIMIT"
+    else:
+        open_id, filled = _entry_maker_chase(symbol, side, qty, tick, signal_id, price_ref)
+        if filled <= 0.0 and FALLBACK == "none":
+            techlog({"level":"info","msg":"no_entry_filled","symbol":symbol})
+            return {"skipped":True,"reason":"no_filled"}
+        time.sleep(0.2)
+        pos_amt_now = _position_amt(symbol)
+        if pos_amt_now > 0:
+            qty = pos_amt_now
+        open_event = "OPEN_MAKER_CHASE"
+        # Якщо був fallback — переіменуємо
+        if ENTRY_MODE == "maker_chase" and filled < qty:
+            if FALLBACK == "market":
+                open_event = "OPEN_FALLBACK_MARKET"
+            elif FALLBACK == "limit_ioc":
+                open_event = "OPEN_FALLBACK_LIMIT_IOC"
+
+    with BR_LOCK:
+        BRACKETS[symbol] = {
+            "id":signal_id,"side":side,"tp_id":None,"sl_id":None,
+            "open_order_id":open_id,"ts":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+        }
+    techlog({"level":"info","msg":"open_order_ok","symbol":symbol,"side":side,"qty":qty,"order_id":open_id,"open_event":open_event})
+
+    # Запис OPEN
+    vwap_open,qty_open,fee_open,asset_open,_=_fetch_trades_for_order(symbol, open_id)
+    exec_log(signal_id,open_event,datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+             vwap_open,qty_open,fee_open,asset_open,None,symbol,side,open_id)
+
+    # ===== Виходи =====
+    tp_id, sl_id = _place_exits(symbol, side, qty, tp_r, sl_r, signal_id)
+    return {"qty":qty,"price_ref":price_ref,"tp":tp_r,"sl":sl_r,"open_order_id":open_id,"tp_id":tp_id,"sl_id":sl_id}
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","5000")))
